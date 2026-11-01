@@ -112,6 +112,7 @@ PY
 - 三大法人买卖超（institutional flows）资料层：`TwInstitutionalFetcher`（`data_provider/tw_institutional_fetcher.py`）提供上市（TWSE T86，legacy `rwd` 端点）/ 上柜（TPEx OpenAPI）每日外资·投信·自营商·三大法人买卖超（单位：**股数**；按日期+市场做单日全市场缓存再过滤个股，TPEx 民国年转西元有单测覆盖）。接口失败/限流/空响应/字段缺失一律 **fail-open** 返回无数据，不中断分析；仅对 `.TW`/`.TWO` 生效，不改动现有市场流程。资料来源为政府开放资料，采「政府资料开放授权条款第 1 版」(OGDL v1，允许商用与再散布，需标示来源)。
 - 三大法人 fetcher 已具备并发缓存防击穿和按 TWSE/TPEx 分流的熔断保护；TPEx OpenAPI 仅服务最新交易日，传入与服务日期不符的明确日期会 fail-open 返回无数据，避免错日资料静默进入报告。
 - 台股财务金额会使用 TWD -> 「新台币」标注，避免落入 A 股语境下的默认「元」。
+- 独立的台股资料底座（`scripts/tw_market_data.py`，详见 [台股资料底座](tw-market-data.md)）：以 FinMind 为主、Yahoo 仅在明确允许时作为替代口径，提供台股主档（代号/名称解析、TWSE/TPEx 由主档判定、保留 ETF 前导零）、带品质与新鲜度状态的日线、还原序列版本与个股/全市场法人，资料存于独立 `tw_*` 资料表。该资料层目前未接入上述分析主流程。
 
 不承诺项：
 

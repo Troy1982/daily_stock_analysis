@@ -437,6 +437,12 @@ daily_stock_analysis/
 | `TICKFLOW_KLINE_ADJUST` | TickFlow 日 K 复权模式：`none`、`forward`、`backward`、`forward_additive`、`backward_additive`。 | `none` | 可选 |
 | `TICKFLOW_BATCH_DAILY_ENABLED` | 是否启用 TickFlow 批量日 K 预取；权限不足会短期缓存失败状态，并继续走常规回退。 | `true` | 可选 |
 | `TICKFLOW_BATCH_SIZE` | TickFlow 日 K 与实时行情批量请求的单批最大标的数。 | `100` | 可选 |
+| `FINMIND_TOKEN` | 台股资料底座（`scripts/tw_market_data.py`）的 FinMind Token；不配置则使用匿名额度（300 次/小时），只以 `Authorization` 头发送。还原股价 `TaiwanStockPriceAdj` 需 FinMind Backer 以上。详见 [台股资料底座](tw-market-data.md)。 | - | 可选 |
+| `FINMIND_REQUESTS_PER_HOUR` / `FINMIND_TIMEOUT_SECONDS` / `FINMIND_MAX_RETRIES` | FinMind 本机每小时请求上限（`0`=自动：无 token 280、有 token 550）、逾时秒数、网络/5xx/429 有限重试次数（429 遵守 Retry-After，单次最多等 30 秒；402 额度用尽、本机预算用尽与权限不足不重试）。 | `0` / `20` / `2` | 可选 |
+| `TW_DAILY_BACKFILL_START` / `TW_DAILY_OVERLAP_DAYS` / `TW_REVALIDATE_HOURS` | 台股日线首次回补起始日、历史重验重叠交易日数、既有区间重验间隔（不限制新资料抓取）。 | `2015-01-01` / `5` / `20` | 可选 |
+| `TW_YAHOO_FALLBACK_ENABLED` | FinMind 失败时另存 Yahoo `split_adjusted` 备援资料；raw 查询不会回传，须明确 `--allow-substitute`。 | `true` | 可选 |
+| `TW_DAILY_PUBLISH_TIME` / `TW_INSTITUTIONAL_PUBLISH_TIME` / `TW_SOURCE_DELAY_GRACE_HOURS` | 台股日线、个股法人的来源预期发布时间（Asia/Taipei，仅为预期）与待发布宽限时数。 | `17:30` / `20:00` / `6` | 可选 |
+| `TW_MARKET_CLOSURE_OVERRIDES` | 台股临时休市日（如台风假），逗号分隔 `YYYY-MM-DD`；亦可用 `calendar override` 写入本机资料库。 | - | 可选 |
 | `FUTU_HK_REALTIME_SOURCE_PRIORITY` | 港股实时行情独立优先级，可选 `futu`、`longbridge`、`akshare`、`yfinance`，按逗号分隔；失败自动回退。 | `futu,longbridge,akshare,yfinance` | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | Longbridge OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | - | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境使用 | - | 可选 |

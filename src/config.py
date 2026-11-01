@@ -987,6 +987,19 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
+    # 台股资料底座（docs/tw-market-data.md）：FinMind 为主、Yahoo 为可选备援
+    finmind_token: Optional[str] = None
+    finmind_requests_per_hour: int = 0  # 0 = 按是否配置 token 自动选择保守额度
+    finmind_timeout_seconds: float = 20.0
+    finmind_max_retries: int = 2
+    tw_daily_overlap_days: int = 5
+    tw_revalidate_hours: float = 20.0
+    tw_daily_backfill_start: str = "2015-01-01"
+    tw_yahoo_fallback_enabled: bool = True
+    tw_daily_publish_time: str = "17:30"
+    tw_institutional_publish_time: str = "20:00"
+    tw_source_delay_grace_hours: float = 6.0
+    tw_market_closure_overrides: List[str] = field(default_factory=list)
     tickflow_api_key: Optional[str] = None
     tickflow_kline_adjust: str = "none"
     tickflow_priority: int = 2
@@ -1933,6 +1946,20 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            finmind_token=(os.getenv('FINMIND_TOKEN') or '').strip() or None,
+            finmind_requests_per_hour=parse_env_int(os.getenv('FINMIND_REQUESTS_PER_HOUR'), 0, field_name='FINMIND_REQUESTS_PER_HOUR', minimum=0),
+            finmind_timeout_seconds=parse_env_float(os.getenv('FINMIND_TIMEOUT_SECONDS'), 20.0, field_name='FINMIND_TIMEOUT_SECONDS', minimum=1.0),
+            finmind_max_retries=parse_env_int(os.getenv('FINMIND_MAX_RETRIES'), 2, field_name='FINMIND_MAX_RETRIES', minimum=0, maximum=5),
+            tw_daily_overlap_days=parse_env_int(os.getenv('TW_DAILY_OVERLAP_DAYS'), 5, field_name='TW_DAILY_OVERLAP_DAYS', minimum=0, maximum=60),
+            tw_revalidate_hours=parse_env_float(os.getenv('TW_REVALIDATE_HOURS'), 20.0, field_name='TW_REVALIDATE_HOURS', minimum=0.0),
+            tw_daily_backfill_start=(os.getenv('TW_DAILY_BACKFILL_START') or '2015-01-01').strip(),
+            tw_yahoo_fallback_enabled=parse_env_bool(os.getenv('TW_YAHOO_FALLBACK_ENABLED'), default=True),
+            tw_daily_publish_time=(os.getenv('TW_DAILY_PUBLISH_TIME') or '17:30').strip(),
+            tw_institutional_publish_time=(os.getenv('TW_INSTITUTIONAL_PUBLISH_TIME') or '20:00').strip(),
+            tw_source_delay_grace_hours=parse_env_float(os.getenv('TW_SOURCE_DELAY_GRACE_HOURS'), 6.0, field_name='TW_SOURCE_DELAY_GRACE_HOURS', minimum=0.0),
+            tw_market_closure_overrides=[
+                item.strip() for item in (os.getenv('TW_MARKET_CLOSURE_OVERRIDES') or '').split(',') if item.strip()
+            ],
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
             tickflow_kline_adjust=normalize_tickflow_kline_adjust(os.getenv('TICKFLOW_KLINE_ADJUST')),
             tickflow_priority=parse_env_int(os.getenv('TICKFLOW_PRIORITY'), 2, field_name='TICKFLOW_PRIORITY', minimum=0),

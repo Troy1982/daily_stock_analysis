@@ -50,6 +50,7 @@ from sqlalchemy import (
     Table,
 )
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
@@ -1321,6 +1322,276 @@ class SkillOpinionOutcomeRecord(Base):
     )
 
 
+# === 台股资料底座（docs/tw-market-data.md）===
+#
+# 独立于 stock_daily：stock_daily 的唯一键是 (code, date)，无法同时保存多来源、
+# 多价格口径与还原版本；台股资料层需要 (证券, 交易日, 来源, 口径, 版本) 维度。
+
+
+class UTCDateTime(TypeDecorator):
+    """时区明确的时间戳：只接受 aware datetime，统一以 UTC ISO8601 字符串保存。
+
+    SQLite 的 DateTime 列会丢弃 tzinfo，重新读出后无法区分 UTC 与本地时间；
+    这里以文本保存 ``2026-10-27T09:30:00.000000+00:00``，读出还原为 aware UTC。
+    写入 naive datetime 直接报错，避免把台北时间误当 UTC 落库。
+    """
+
+    impl = String(40)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
+            raise TypeError(f"UTCDateTime expects datetime, got {type(value).__name__}")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("UTCDateTime refuses naive datetime; attach a timezone first")
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            raise ValueError(f"UTCDateTime column holds naive value: {value!r}")
+        return parsed.astimezone(timezone.utc)
+
+
+TW_MARKET_SECURITY_ID = "TW:MARKET"
+
+
+class TwSecurity(Base):
+    """台股证券主档（当前状态）。"""
+
+    __tablename__ = "tw_security"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    security_id = Column(String(16), nullable=False, unique=True)
+    stock_id = Column(String(12), nullable=False, unique=True)
+    name = Column(String(128), nullable=False)
+    current_market = Column(String(12), nullable=False)
+    security_type = Column(String(16), nullable=False)
+    type_basis = Column(String(24), nullable=False)
+    industry = Column(String(64))
+    yahoo_symbol = Column(String(20))
+    listing_status = Column(String(24), nullable=False)
+    listing_date = Column(Date)
+    source = Column(String(32), nullable=False)
+    source_as_of = Column(Date)
+    fetched_at = Column(UTCDateTime, nullable=False)
+
+
+class TwSecurityMarketHistory(Base):
+    """来源对市场别的观察记录；observed_date 不等于生效日期。"""
+
+    __tablename__ = "tw_security_market_history"
+    __table_args__ = (
+        UniqueConstraint("stock_id", "market", "observed_date", "source", name="uix_tw_market_hist"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_id = Column(String(12), nullable=False, index=True)
+    market = Column(String(12), nullable=False)
+    observed_date = Column(Date)
+    source = Column(String(32), nullable=False)
+    fetched_at = Column(UTCDateTime, nullable=False)
+    effective_start = Column(Date)
+    effective_end = Column(Date)
+    effective_basis = Column(String(16), nullable=False, default="unknown")
+
+
+class TwSecurityMasterMeta(Base):
+    """主档刷新状态（每个来源一行）。"""
+
+    __tablename__ = "tw_security_master_meta"
+
+    source = Column(String(32), primary_key=True)
+    last_success_at = Column(UTCDateTime)
+    last_attempt_at = Column(UTCDateTime)
+    row_count = Column(Integer)
+    last_error = Column(Text)
+
+
+class TwDailyBar(Base):
+    """台股日线；同证券同交易日可并存多个来源、口径与还原版本。"""
+
+    __tablename__ = "tw_daily_bar"
+    __table_args__ = (
+        UniqueConstraint(
+            "security_id", "trade_date", "provider", "adjustment", "series_version",
+            name="uix_tw_daily_bar",
+        ),
+        Index("ix_tw_daily_bar_series", "security_id", "provider", "adjustment", "series_version", "trade_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    security_id = Column(String(16), nullable=False)
+    trade_date = Column(Date, nullable=False)
+    provider = Column(String(24), nullable=False)
+    adjustment = Column(String(24), nullable=False)
+    series_version = Column(String(64), nullable=False)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume_shares = Column(Integer)
+    volume_unit_raw = Column(String(24))
+    volume_unit_status = Column(String(16))
+    turnover_twd = Column(Float)
+    currency = Column(String(8), nullable=False, default="TWD")
+    market_segment = Column(String(16))
+    row_quality = Column(String(16), nullable=False)
+    issues = Column(Text)
+    provider_updated_at = Column(UTCDateTime)
+    fetched_at = Column(UTCDateTime, nullable=False)
+
+
+class TwAdjustedSeries(Base):
+    """还原序列版本；同 (证券, 来源, 口径) 最多一个 active。"""
+
+    __tablename__ = "tw_adjusted_series"
+    __table_args__ = (
+        UniqueConstraint("security_id", "provider", "adjustment", "series_version", name="uix_tw_adj_series"),
+        Index(
+            "uix_tw_adj_series_active",
+            "security_id", "provider", "adjustment",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    security_id = Column(String(16), nullable=False)
+    provider = Column(String(24), nullable=False)
+    adjustment = Column(String(24), nullable=False)
+    series_version = Column(String(64), nullable=False)
+    base_date = Column(Date)
+    start_date = Column(Date)
+    end_date = Column(Date)
+    row_count = Column(Integer, nullable=False, default=0)
+    build_status = Column(String(16), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=False)
+    failure_reason = Column(Text)
+    created_at = Column(UTCDateTime, nullable=False)
+    activated_at = Column(UTCDateTime)
+    # 基准日依据（来源未提供确切基准时为推定，写明依据）、已纳入的分割事件、验证报告（JSON）
+    base_date_basis = Column(Text)
+    split_events = Column(Text)
+    validation = Column(Text)
+
+
+class TwInstitutionalFlow(Base):
+    """法人买卖超；scope 区分个股(stock)与全市场(market)。"""
+
+    __tablename__ = "tw_institutional_flow"
+    __table_args__ = (
+        UniqueConstraint("scope", "security_id", "trade_date", "provider", "category", name="uix_tw_inst_flow"),
+        Index("ix_tw_inst_flow_lookup", "scope", "security_id", "trade_date"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope = Column(String(8), nullable=False)
+    security_id = Column(String(16), nullable=False)
+    trade_date = Column(Date, nullable=False)
+    provider = Column(String(24), nullable=False)
+    category = Column(String(32), nullable=False)
+    source_category = Column(String(64))
+    buy = Column(Integer)
+    sell = Column(Integer)
+    net = Column(Integer)
+    unit = Column(String(16), nullable=False)
+    unit_status = Column(String(16), nullable=False)
+    is_derived = Column(Boolean, nullable=False, default=False)
+    components = Column(Text)
+    derivation_completeness = Column(String(16))
+    derivation_reasons = Column(Text)
+    definition = Column(Text)
+    fetched_at = Column(UTCDateTime, nullable=False)
+
+
+class TwSyncState(Base):
+    """每个 (证券, 资料集, 来源, 口径) 的同步状态。"""
+
+    __tablename__ = "tw_sync_state"
+    __table_args__ = (
+        UniqueConstraint("security_id", "dataset", "provider", "adjustment", name="uix_tw_sync_state"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    security_id = Column(String(16), nullable=False)
+    dataset = Column(String(32), nullable=False)
+    provider = Column(String(24), nullable=False)
+    adjustment = Column(String(24), nullable=False)
+    last_attempt_at = Column(UTCDateTime)
+    last_success_at = Column(UTCDateTime)
+    last_revalidated_at = Column(UTCDateTime)
+    last_actual_date = Column(Date)
+    last_error = Column(Text)
+
+
+class TwFetchLog(Base):
+    """每次抓取的可追踪记录（含失败原因、来源切换与上游修正）。"""
+
+    __tablename__ = "tw_fetch_log"
+    __table_args__ = (
+        Index("ix_tw_fetch_log_lookup", "security_id", "dataset", "provider", "started_at"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(36), nullable=False, index=True)
+    security_id = Column(String(16))
+    dataset = Column(String(32), nullable=False)
+    provider = Column(String(24), nullable=False)
+    adjustment = Column(String(24))
+    action = Column(String(24), nullable=False)
+    requested_start = Column(Date)
+    requested_end = Column(Date)
+    returned_start = Column(Date)
+    returned_end = Column(Date)
+    status = Column(String(24), nullable=False)
+    reason = Column(Text)
+    fallback_from = Column(String(24))
+    rows = Column(Integer, nullable=False, default=0)
+    revised_rows = Column(Integer, nullable=False, default=0)
+    started_at = Column(UTCDateTime, nullable=False)
+    finished_at = Column(UTCDateTime)
+
+
+class TwCalendarOverride(Base):
+    """临时休市 / 临时开市覆写（优先于 XTAI 预定行事历）。"""
+
+    __tablename__ = "tw_calendar_override"
+
+    date = Column(Date, primary_key=True)
+    is_session = Column(Boolean, nullable=False)
+    reason = Column(String(255))
+    source = Column(String(32), nullable=False)
+    created_at = Column(UTCDateTime, nullable=False)
+
+
+class TwCalendarSourceDay(Base):
+    """外部来源回报的交易日（仅在其覆盖范围内用于确认历史）。"""
+
+    __tablename__ = "tw_calendar_source_day"
+    __table_args__ = (UniqueConstraint("source", "date", name="uix_tw_cal_source_day"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String(32), nullable=False)
+    date = Column(Date, nullable=False)
+
+
+class TwCalendarSourceCoverage(Base):
+    """外部交易日来源的覆盖范围与取得时间。"""
+
+    __tablename__ = "tw_calendar_source_coverage"
+
+    source = Column(String(32), primary_key=True)
+    covered_start = Column(Date)
+    covered_end = Column(Date)
+    fetched_at = Column(UTCDateTime, nullable=False)
+    provider_updated_at = Column(UTCDateTime)
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 
@@ -1408,6 +1679,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_schema_migration_record()
             self._ensure_intelligence_items_unique_index()
             self._ensure_chat_session_schema()
+            self._ensure_tw_market_columns()
 
             self._initialized = True
             logger.info(f"数据库初始化完成: {db_url}")
@@ -1425,6 +1697,31 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._SessionLocal = None
             self.__class__._instance = None
             raise
+
+    # 台股资料底座表在本分支开发期间新增的栏位；早期建立的本机 DB 以 ADD COLUMN 补齐。
+    _TW_MARKET_ADDED_COLUMNS = {
+        "tw_adjusted_series": ("base_date_basis", "split_events", "validation"),
+        "tw_institutional_flow": ("derivation_reasons",),
+    }
+
+    def _ensure_tw_market_columns(self) -> None:
+        if not self._is_sqlite_engine:
+            return
+        inspector = inspect(self._engine)
+        existing_tables = set(inspector.get_table_names())
+        for table, columns in self._TW_MARKET_ADDED_COLUMNS.items():
+            if table not in existing_tables:
+                continue
+            present = {col["name"] for col in inspector.get_columns(table)}
+            for column in columns:
+                if column in present:
+                    continue
+                try:
+                    with self._engine.begin() as conn:
+                        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(exc, column):
+                        raise
 
     def _ensure_schema_migration_record(
         self,
