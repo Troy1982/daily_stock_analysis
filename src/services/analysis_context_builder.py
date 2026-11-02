@@ -20,6 +20,7 @@ from src.schemas.analysis_context_pack import (
 
 _REALTIME_OVERLAY_WARNING = "intraday_realtime_overlay"
 _REALTIME_FALLBACK_WARNING = "realtime_provider_fallback"
+_TREND_SIGNAL_WITHHELD_WARNING = "trend_signal_withheld_missing_input"
 _FUNDAMENTAL_FAILED_REASON = "fundamental_pipeline_failed"
 _QUALITY_BLOCK_WEIGHTS: Dict[str, int] = {
     "quote": 25,
@@ -88,6 +89,14 @@ class AnalysisContextBuilder:
 
         blocks["quote"] = _build_quote_block(artifacts)
         blocks["daily_bars"] = _build_daily_bars_block(artifacts)
+        tw_market = _tw_market_data(artifacts)
+        if tw_market is not None:
+            # 台股底座：日线来源/口径/新鲜度/完整性由程序判定，限制代码直接进入数据质量提醒。
+            blocks["daily_bars"].source = "tw_market_data:finmind:raw"
+            blocks["daily_bars"].metadata["tw_market_data_status"] = tw_market.get("status")
+            if tw_market.get("status") != "ok" and blocks["daily_bars"].status == ContextFieldStatus.AVAILABLE:
+                blocks["daily_bars"].status = ContextFieldStatus.PARTIAL
+            data_quality_warnings.extend(str(code) for code in tw_market.get("limitations") or [])
         technical_block, technical_warnings = _build_technical_block(artifacts)
         blocks["technical"] = technical_block
         data_quality_warnings.extend(technical_warnings)
@@ -175,6 +184,13 @@ def _build_quote_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextB
         warnings=warnings,
         metadata=_quote_metadata(artifacts, quote),
     )
+
+
+def _tw_market_data(artifacts: PipelineAnalysisArtifacts) -> Optional[Dict[str, Any]]:
+    for source in (artifacts.base_context, artifacts.enhanced_context):
+        if isinstance(source, dict) and isinstance(source.get("tw_market_data"), dict):
+            return source["tw_market_data"]
+    return None
 
 
 def _build_daily_bars_block(artifacts: PipelineAnalysisArtifacts) -> AnalysisContextBlock:
@@ -265,14 +281,18 @@ def _build_technical_block(
         artifacts.enhanced_context
     )
     warnings = [_REALTIME_OVERLAY_WARNING] if has_realtime_overlay else []
+    # 分析器因必要输入缺失（如前一交易日缺漏）不输出综合评分/信号时，技术区块只算部分可用。
+    signal_withheld = "signal_score" in trend and trend.get("signal_score") is None
+    if signal_withheld:
+        warnings.append(_TREND_SIGNAL_WITHHELD_WARNING)
     block_status = (
         ContextFieldStatus.PARTIAL
-        if has_realtime_overlay
+        if has_realtime_overlay or signal_withheld
         else ContextFieldStatus.AVAILABLE
     )
     items: Dict[str, AnalysisContextItem] = {
         "trend_result": AnalysisContextItem(
-            status=ContextFieldStatus.AVAILABLE,
+            status=ContextFieldStatus.PARTIAL if signal_withheld else ContextFieldStatus.AVAILABLE,
             value=trend,
             warnings=list(warnings),
         )

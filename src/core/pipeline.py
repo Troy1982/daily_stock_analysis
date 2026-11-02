@@ -474,6 +474,17 @@ class StockAnalysisPipeline:
                 if is_index
                 else get_market_for_stock(normalize_stock_code(code))
             )
+            tw_data = None if is_index else self._tw_bridge().recall(code)
+            if tw_data is None and not is_index and self._is_tw_identity(code, analysis_target):
+                # 台股代号未经 process_single_stock 准备资料：明确失败，不走既有 stock_daily / Yahoo。
+                return self._build_tw_failed_result(
+                    code, code, "tw_data_not_prepared: 台股分析须先经底座准备资料", report_type
+                )
+            if tw_data is not None and tw_data.status == "failed":
+                # 完全没有可用 raw 日线：明确失败，不调用 LLM。
+                return self._build_tw_failed_result(
+                    code, tw_data.security.name, tw_data.failure_reason or "no usable raw daily bars", report_type
+                )
             market_phase_context = build_market_phase_context(
                 market=market,
                 current_time=current_time,
@@ -508,13 +519,16 @@ class StockAnalysisPipeline:
                     None,
                 )
                 stock_name = index_name or analysis_target.display_code or code
+            elif tw_data is not None:
+                stock_name = tw_data.security.name
             else:
                 stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
 
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
+            # 台股底座：即时行情（Yahoo）不并入 raw 序列，盘中不在范围内，故不取用。
             realtime_quote = None
             try:
-                if self.config.enable_realtime_quote:
+                if self.config.enable_realtime_quote and tw_data is None:
                     realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
                     if realtime_quote:
                         # 股票使用实时行情名称；指数保持注册表中文名为权威显示名。
@@ -644,7 +658,13 @@ class StockAnalysisPipeline:
                 frozen = get_frozen_target_date()
                 end_date = frozen if frozen else get_market_now(_mkt).date()
                 start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
-                historical_bars = self.db.get_data_range(code, start_date, end_date)
+                if tw_data is not None:
+                    # 台股：只用底座 raw 可用列；不读 stock_daily、不并入即时行情；
+                    # 讯号所需指标不可计算时不产生趋势结果，MA60 不足不以 MA20 代替。
+                    trend_result = self._tw_bridge().run_trend_analysis(self.trend_analyzer, tw_data)
+                    historical_bars = []
+                else:
+                    historical_bars = self.db.get_data_range(code, start_date, end_date)
                 if historical_bars:
                     df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
                     # Issue #234: Augment with realtime for intraday MA calculation
@@ -939,6 +959,7 @@ class StockAnalysisPipeline:
 
             if result:
                 self._append_daily_data_source(result, context, analysis_target)
+                self._apply_tw_data_quality(result, code)
 
             # Step 8: 保存分析历史记录
             if result and result.success:
@@ -1090,7 +1111,7 @@ class StockAnalysisPipeline:
                 'bias_ma10': trend_result.bias_ma10,
                 'volume_status': trend_result.volume_status.value,
                 'volume_trend': trend_result.volume_trend,
-                'buy_signal': trend_result.buy_signal.value,
+                'buy_signal': trend_result.buy_signal.value if trend_result.buy_signal is not None else None,
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
                 'risk_factors': trend_result.risk_factors,
@@ -1400,6 +1421,8 @@ class StockAnalysisPipeline:
         analysis_target: Optional[AnalysisTarget] = None,
     ) -> None:
         """Ensure at least *min_days* of K-line history is in DB for agent tools."""
+        if self._is_tw_identity(code, analysis_target):
+            return  # 台股历史由 history_loader 从底座读取，不预抓 Yahoo 写入 stock_daily
         from src.services.history_loader import get_frozen_target_date
 
         target = get_frozen_target_date()
@@ -1830,6 +1853,7 @@ class StockAnalysisPipeline:
                     analysis_context,
                     analysis_target,
                 )
+                self._apply_tw_data_quality(result, code)
 
             resolved_stock_name = result.name if result and result.name else stock_name
 
@@ -1966,6 +1990,36 @@ class StockAnalysisPipeline:
         self, code: str, analysis_target: Optional[AnalysisTarget] = None
     ) -> Optional[Dict[str, Any]]:
         """Load analysis context, fetching JP/KR/TW daily bars when DB has no context."""
+        tw_data = self._tw_bridge().recall(code)
+        if tw_data is None and (analysis_target is None or analysis_target.asset_type != ParseStatus.INDEX) \
+                and self._is_tw_identity(code, analysis_target):
+            return None  # 台股身分但无准备资料：不读 stock_daily、不回落 Yahoo
+        if tw_data is not None:
+            # 台股底座：上下文只由 tw_* raw 可用列组成，附程序判定的品质摘要。
+            if tw_data.df is None or tw_data.df.empty:
+                return None
+            context = self._build_analysis_context_from_daily_df(
+                code, tw_data.df.drop(columns=["prev_session_adjacent"])
+            )
+            if context is None:
+                return None
+            if len(tw_data.df) > 1 and not bool(tw_data.df.iloc[-1]["prev_session_adjacent"]):
+                # 前一可用列并非前一交易日：不提供“昨日”与单日比率，避免把跨缺日变化当成单日值。
+                previous = context.pop("yesterday", None)
+                context.pop("price_change_ratio", None)
+                context.pop("volume_change_ratio", None)
+                if previous is not None:
+                    context["previous_available_bar"] = {
+                        **previous,
+                        "semantics": "latest usable row before today; NOT the previous session (sessions missing in between)",
+                    }
+            for key in ("today", "yesterday", "previous_available_bar"):
+                if isinstance(context.get(key), dict):
+                    context[key]["data_source"] = self._tw_bridge().DATA_SOURCE_TOKEN
+            context["tw_market_data"] = tw_data.to_context(
+                normalize_report_language(getattr(self.config, "report_language", "zh"))
+            )
+            return context
         context = self.db.get_analysis_context(code)
         if isinstance(context, dict) and context:
             return context
@@ -2040,7 +2094,9 @@ class StockAnalysisPipeline:
                     (float(today.get("close", 0)) - float(yesterday_close)) / float(yesterday_close) * 100,
                     2,
                 )
-            context["ma_status"] = self.db._analyze_ma_status(SimpleNamespace(**today))
+            context["ma_status"] = self.db._analyze_ma_status(
+                SimpleNamespace(**{"close": None, "ma5": None, "ma10": None, "ma20": None, **today})
+            )
 
         return context
 
@@ -3327,6 +3383,17 @@ class StockAnalysisPipeline:
         """
         logger.info(f"========== 开始处理 {code} ==========")
 
+        # 台股底座路由：裸代号歧义、后缀冲突、主档不可用都在此明确失败，不落入其他市场或 Yahoo。
+        tw_route, tw_error = self._route_tw_code(code, analysis_target)
+        if tw_error is not None:
+            logger.warning(f"[{code}] 台股代号路由失败: {tw_error}")
+            return self._build_tw_failed_result(code, code, tw_error, report_type)
+        if tw_route is not None:
+            if tw_route.code != code:
+                logger.info(f"[{code}] 台股代号解析为 {tw_route.code}（{tw_route.security.name}，{tw_route.security.market.value}）")
+                analysis_target = None
+            code = tw_route.code
+
         from src.services.history_loader import set_frozen_target_date, reset_frozen_target_date
         frozen_td = self._resolve_resume_target_date(
             code, current_time=current_time, analysis_target=analysis_target
@@ -3344,10 +3411,24 @@ class StockAnalysisPipeline:
             )
         try:
             self._emit_progress(12, f"{code}：正在准备分析任务")
-            # Step 1: 获取并保存数据
-            success, error = self.fetch_and_save_stock_data(
-                code, current_time=current_time, analysis_target=analysis_target
-            )
+            # Step 1: 获取并保存数据（台股走底座 tw_* 资料，不写入 stock_daily）
+            if tw_route is not None:
+                tw_data = self._prepare_tw_analysis_data(
+                    tw_route, current_time=current_time, target_date=frozen_td
+                )
+                if tw_data.status == "failed":
+                    # 台股身分已确定：准备失败即本档失败，不回落 stock_daily / Yahoo，也不调用 LLM。
+                    logger.warning(f"[{code}] 台股资料不可用: {tw_data.failure_reason}")
+                    if skip_analysis:
+                        return None
+                    return self._build_tw_failed_result(
+                        code, tw_data.security.name, tw_data.failure_reason or "TW data unavailable", report_type
+                    )
+                success, error = True, None
+            else:
+                success, error = self.fetch_and_save_stock_data(
+                    code, current_time=current_time, analysis_target=analysis_target
+                )
             
             if not success:
                 logger.warning(f"[{code}] 数据获取失败: {error}")
@@ -3392,8 +3473,125 @@ class StockAnalysisPipeline:
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
             return None
         finally:
+            if tw_route is not None:
+                self._tw_bridge().forget(code)
             reset_run_diagnostic_context(diag_token)
             reset_frozen_target_date(token)
+
+    # ------------------------------------------------------------ 台股底座接入
+    @staticmethod
+    def _tw_bridge():
+        from src.services.tw_market_data import analysis_bridge
+
+        return analysis_bridge
+
+    def _route_tw_code(
+        self, code: str, analysis_target: Optional[AnalysisTarget]
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """Return ``(route, error)``; both None means the code keeps the existing market path."""
+        if analysis_target is not None and analysis_target.asset_type == ParseStatus.INDEX:
+            return None, None
+        bridge = self._tw_bridge()
+        if not bridge.is_tw_candidate(code):
+            return None, None
+        try:
+            return bridge.route_code(code), None
+        except bridge.TwRouteError as exc:
+            return None, f"{exc.reason_code}: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            if "." in code:
+                # 显式台股后缀：底座不可用时明确失败，不改走 Yahoo。
+                return None, f"tw_route_failed: {type(exc).__name__}: {exc}"
+            logger.warning(f"[{code}] 台股路由检查失败，维持既有市场判定: {exc}")
+            return None, None
+
+    def _prepare_tw_analysis_data(
+        self,
+        route: Any,
+        *,
+        current_time: Optional[datetime] = None,
+        target_date: Optional[date] = None,
+    ) -> Any:
+        """Prepare and remember TW data; failures are remembered too so the TW identity survives."""
+        bridge = self._tw_bridge()
+        try:
+            data = bridge.prepare_analysis(route, as_of=current_time, target_date=target_date)
+        except Exception as exc:  # noqa: BLE001 - 单股失败不影响整体
+            logger.exception(f"[{route.code}] 台股底座资料准备失败: {exc}")
+            data = bridge.failed_data(route, f"tw_preparation_failed: {type(exc).__name__}: {exc}")
+        bridge.remember(data)
+        logger.info(
+            f"[{route.code}] 台股底座资料: status={data.status} rows={data.usable_rows} "
+            f"latest={data.latest.get('dates', {}).get('actual_data_date')} cutoff={data.cutoff_date} "
+            f"limitations={[item['code'] for item in data.limitations]}"
+        )
+        return data
+
+    def _is_tw_identity(self, code: str, analysis_target: Optional[AnalysisTarget] = None) -> bool:
+        """True when the code is (or must be treated as) a TW foundation code: never use legacy paths."""
+        if self._tw_bridge().recall(code) is not None:
+            return True
+        route, error = self._route_tw_code(code, analysis_target)
+        return route is not None or error is not None
+
+    def _build_tw_failed_result(
+        self, code: str, name: str, reason: str, report_type: Optional[ReportType] = None
+    ) -> AnalysisResult:
+        """台股资料不可用时的明确失败结果：不调用 LLM，不产生看似正常的结论。"""
+        report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
+        english = report_language == "en"
+        return AnalysisResult(
+            code=code,
+            name=name,
+            sentiment_score=50,
+            trend_prediction=localize_trend_prediction("震荡", report_language),
+            operation_advice=localize_operation_advice("观望", report_language),
+            confidence_level=localize_confidence_level("低", report_language),
+            analysis_summary=(
+                f"Taiwan stock analysis not performed: {reason}"
+                if english
+                else f"台股分析未执行：{reason}"
+            ),
+            risk_warning=reason,
+            data_sources="tw:unavailable",
+            data_quality_limitations=[reason],
+            success=False,
+            error_message=reason,
+            model_used=None,
+            report_language=report_language,
+        )
+
+    def _apply_tw_data_quality(self, result: Optional[AnalysisResult], code: str) -> None:
+        """把程序判定的台股资料来源与限制写入结果（报告 data_sources / risk_warning）。"""
+        if result is None:
+            return
+        data = self._tw_bridge().recall(code)
+        if data is None:
+            return
+        tokens = [item.strip() for item in (result.data_sources or "").split(",") if item.strip()]
+        for token in (
+            f"daily:{self._tw_bridge().DATA_SOURCE_TOKEN}",
+            f"tw_data:{data.status}",
+            f"institution:{data.institution.get('status')}",
+        ):
+            if token not in tokens:
+                tokens.append(token)
+        result.data_sources = ",".join(tokens)
+        if not result.name or result.name == code:
+            result.name = data.security.name
+        latest_bar = data.latest.get("bar") or {}
+        if latest_bar.get("close") is not None:
+            # 台股不并入 Yahoo 即时价；分析价格为最近完整 raw 收盘。
+            result.current_price = latest_bar.get("close")
+        texts = data.limitation_texts(getattr(result, "report_language", "zh"))
+        result.data_quality_limitations = list(texts)
+        if texts:
+            english = str(getattr(result, "report_language", "zh")).lower().startswith("en")
+            header = "[Data limitations, program-determined] " if english else "【资料限制（程序判定）】"
+            block = header + ("; ".join(texts) if english else "；".join(texts))
+            existing = result.risk_warning or ""
+            if block not in existing:
+                result.risk_warning = f"{block}\n{existing}".strip()
     
     def run(
         self,

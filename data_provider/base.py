@@ -4133,74 +4133,43 @@ class DataFetcherManager:
                 ["not supported for offshore market"],
             )
 
-        # institution: tw (台股) has a free official 三大法人 (institutional net buy/sell)
-        # feed (TWSE T86 / TPEx OpenAPI); every other offshore market keeps not_supported.
-        # tw-only + strictly additive + fail-open: any error or no-data -> not_supported,
-        # which never interrupts the main analysis. Raw net figures only — no derived
-        # signal / score / schema (per the v2 scope confirmed on issue #1777).
-        tw_record = None
-        if market == "tw":
-            fetcher = getattr(self, "_tw_institutional_fetcher", None)
-            if fetcher is None:
-                # Wiring (import + construct) is a one-time op; a failure here is a
-                # programming / deploy bug, so log it LOUD (error). Still fail-open
-                # (never interrupt the main analysis — a hard requirement of #1777).
-                try:
-                    from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+        # institution: tw (台股) 三大法人 comes from the TW data foundation
+        # (src/services/tw_market_data, FinMind per-stock flows with per-day completeness,
+        # verified unit and no double counting; TWSE T86 / TPEx stay as its official
+        # cross-check). Field semantics match the former T86/TPEx block. tw-only + fail-open:
+        # any error -> not_supported, never interrupting the main analysis; every other
+        # offshore market keeps not_supported and never touches the foundation.
+        institution_status = "not_supported"
+        result_ctx["institution"] = self._build_fundamental_block(
+            "not_supported",
+            {},
+            [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+            ["not supported for offshore market"],
+        )
+        if market == "tw" and fetch_timeout > 0:
+            tw_block = None
+            try:
+                from src.services.tw_market_data import analysis_bridge
 
-                    fetcher = TwInstitutionalFetcher()
-                    self._tw_institutional_fetcher = fetcher
-                except Exception as exc:  # noqa: BLE001 - wiring failure: loud but fail-open
-                    logger.error("[tw-inst] fetcher init failed (wiring bug?) code=%s: %s", stock_code, exc)
-                    fetcher = None
-            # fetch_timeout == 0 disables per-fetch fundamental fetches (same as valuation /
-            # bundle above, which gate on fetch_timeout); honour that for institution too so
-            # the FUNDAMENTAL_FETCH_TIMEOUT_SECONDS=0 config semantic is not bypassed.
-            if fetcher is not None and fetch_timeout > 0:
-                # The tw institution block is a WHOLE-MARKET download (~4-5s), far slower
-                # than the per-symbol quote/bundle fetches, and it is the LAST offshore
-                # block. When enabled, give it the full REMAINING stage budget rather than
-                # the ~3s per-fetch cap that starves it and makes the first/only stock of a
-                # run coin-flip between ok and not_supported. Bounded by the stage deadline
-                # via _run_with_retry, so it fails open (never blocks).
-                inst_timeout = max(stage_timeout - (time.time() - start_ts), 0.0)
-                if inst_timeout > 0:
-                    tw_record, inst_err, _inst_ms = self._run_with_retry(
-                        lambda: fetcher.get_institutional_net(stock_code),
-                        inst_timeout,
-                        "fundamental_tw_institution",
-                    )
-                    if inst_err:
-                        logger.warning("[tw-inst] fetch failed/timeout code=%s: %s", stock_code, inst_err)
+                prepared = analysis_bridge.recall(stock_code)
+                if prepared is not None:
+                    tw_block = prepared.institution
                 else:
-                    tw_record = None
-        # status 'ok' only when the record carries all core net figures (a genuine 0 is
-        # kept — 0 is not None); None / missing core field / fetch failure -> not_supported.
-        _tw_core = ("foreign_net", "trust_net", "dealer_net", "total_net")
-        if tw_record is not None and all(tw_record.get(key) is not None for key in _tw_core):
-            institution_status = "ok"
-            result_ctx["institution"] = self._build_fundamental_block(
-                "ok",
-                {
-                    "foreign_net": tw_record.get("foreign_net"),
-                    "trust_net": tw_record.get("trust_net"),
-                    "dealer_net": tw_record.get("dealer_net"),
-                    "total_net": tw_record.get("total_net"),
-                    "unit": tw_record.get("unit"),
-                    "date": tw_record.get("date"),
-                    "source": tw_record.get("source"),
-                },
-                [{"provider": tw_record.get("source", "tw-institutional"), "result": "ok", "duration_ms": 0}],
-                [],
-            )
-        else:
-            institution_status = "not_supported"
-            result_ctx["institution"] = self._build_fundamental_block(
-                "not_supported",
-                {},
-                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
-                ["not supported for offshore market"],
-            )
+                    inst_timeout = max(stage_timeout - (time.time() - start_ts), 0.0)
+                    if inst_timeout > 0:
+                        tw_block, inst_err, _inst_ms = self._run_with_retry(
+                            lambda: analysis_bridge.institution_block(stock_code),
+                            inst_timeout,
+                            "fundamental_tw_institution",
+                        )
+                        if inst_err:
+                            logger.warning("[tw-inst] foundation read failed/timeout code=%s: %s", stock_code, inst_err)
+            except Exception as exc:  # noqa: BLE001 - wiring failure: loud but fail-open
+                logger.error("[tw-inst] foundation wiring failed code=%s: %s", stock_code, exc)
+                tw_block = None
+            if isinstance(tw_block, dict) and tw_block.get("status") in ("ok", "partial", "failed"):
+                institution_status = tw_block["status"]
+                result_ctx["institution"] = tw_block
 
         result_ctx["belong_boards"] = belong_boards or futu_boards
 

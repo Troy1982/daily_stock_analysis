@@ -15,7 +15,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple, Callable, Union
 
 import litellm
@@ -873,6 +873,13 @@ def _sanitize_trend_analysis_for_prompt(
             else f"成交量较昨日变化约 {parsed_volume_change:.2f} 倍，可能存在异常数据或一次性冲量；量能信号必须降权解读，不能机械视为强确认。"
         )
 
+    # 分析器可能因输入不足而不输出综合评分/信号（None）；提示词中明确写“不可用”，不以 0 分代替。
+    unavailable_text = "Unavailable (required input missing)" if english else "不可用（必要输入缺失）"
+    if trend_dict.get("buy_signal", "") is None:
+        trend_dict["buy_signal"] = unavailable_text
+    score = trend_dict.get("signal_score", 0)
+    trend_dict["signal_score_display"] = unavailable_text if score is None else f"{score}/100"
+
     trend_dict["signal_reasons"] = signal_reasons
     trend_dict["risk_factors"] = risk_factors
     trend_dict["prompt_consistency_notes"] = prompt_notes
@@ -1714,6 +1721,52 @@ def get_stock_name_multi_source(
     return f'股票{stock_code}'
 
 
+def _format_tw_market_quality_section(tw_market: Dict[str, Any], *, english: bool) -> str:
+    """Render the program-determined TW data-quality summary for the LLM prompt."""
+    latest = tw_market.get("latest") or {}
+    dates = latest.get("dates") or {}
+    fresh = latest.get("freshness") or {}
+    window = tw_market.get("analysis_window") or {}
+    indicators = tw_market.get("indicators") or {}
+    blocked = [name for name, item in indicators.items() if not item.get("computable")]
+    limitations = tw_market.get("limitation_texts") or []
+    if english:
+        lines = [
+            "",
+            "### Taiwan Data Quality (program-determined; do not repair or re-judge values)",
+            f"- Source: {tw_market.get('provider')} {tw_market.get('adjustment')} (series {tw_market.get('series_version')}); "
+            f"volume unit {tw_market.get('volume_unit')}, turnover {tw_market.get('turnover_unit')}; no intraday quote merged",
+            f"- Latest usable bar: {dates.get('actual_data_date')} | expected {dates.get('source_expected_date')} | "
+            f"market last closed {dates.get('market_last_closed_session')} | freshness {fresh.get('freshness')}",
+            f"- Analysis window {window.get('requested_start')}..{window.get('requested_end')}: {window.get('completeness')} "
+            f"({window.get('present_sessions')}/{window.get('expected_sessions')} sessions, {tw_market.get('usable_rows')} usable rows, "
+            f"missing {len(window.get('missing_dates') or [])})",
+            f"- Indicators not computable: {', '.join(blocked) or 'none'}",
+            f"- Overall data status: {tw_market.get('status')}",
+        ]
+        if limitations:
+            lines.append("- Limitations: " + "; ".join(limitations))
+        lines.append("> State these limitations in the report; never invent missing sessions or values.")
+    else:
+        lines = [
+            "",
+            "### 台股资料品质（程序判定，请勿自行修补或重新判定数值）",
+            f"- 来源：{tw_market.get('provider')} {tw_market.get('adjustment')}（序列 {tw_market.get('series_version')}）；"
+            f"成交量单位 {tw_market.get('volume_unit')}、成交金额 {tw_market.get('turnover_unit')}；未并入盘中即时价",
+            f"- 最新可用日线：{dates.get('actual_data_date')}｜来源预期 {dates.get('source_expected_date')}｜"
+            f"市场最近收盘 {dates.get('market_last_closed_session')}｜新鲜度 {fresh.get('freshness')}",
+            f"- 分析窗 {window.get('requested_start')}..{window.get('requested_end')}：{window.get('completeness')}"
+            f"（{window.get('present_sessions')}/{window.get('expected_sessions')} 交易日，可用 {tw_market.get('usable_rows')} 列，"
+            f"缺 {len(window.get('missing_dates') or [])} 日）",
+            f"- 不可计算指标：{'、'.join(blocked) or '无'}",
+            f"- 整体资料状态：{tw_market.get('status')}",
+        ]
+        if limitations:
+            lines.append("- 限制：" + "；".join(limitations))
+        lines.append("> 报告须明列上述限制；不得虚构缺漏交易日或数值。")
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class AnalysisResult:
     """
@@ -1781,6 +1834,8 @@ class AnalysisResult:
     # 「未纳入新闻面证据」。
     news_evidence_present: bool = False
     data_sources: str = ""  # 数据来源说明
+    # 程序判定的资料限制（非 LLM 产生，例如台股底座的缺日/过期/样本不足），报告直接呈现。
+    data_quality_limitations: List[str] = field(default_factory=list)
     success: bool = True
     error_message: Optional[str] = None
 
@@ -4623,6 +4678,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 > 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。
 """
 
+        # 台股底座资料品质（程序判定）— tw-only，仅当上下文带 tw_market_data 时注入。
+        tw_market = context.get('tw_market_data')
+        if isinstance(tw_market, dict):
+            prompt += _format_tw_market_quality_section(tw_market, english=english)
+
         # 添加三大法人动向（台股筹码过滤器）— tw-only；仅当 institution 区块 status='ok'
         # 且有净额时注入，其他市场 status='not_supported' 会跳过，严格 additive。
         institution_block = (
@@ -4759,7 +4819,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | {bias_label} (MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | Volume Status | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
 | System Signal | {trend.get('buy_signal', unknown_text)} | |
-| System Score | {trend.get('signal_score', 0)}/100 | |
+| System Score | {trend.get('signal_score_display')} | |
 
 #### System Analysis Reasons
 **{reasons_label}**:
@@ -4787,7 +4847,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
 | 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 系统评分 | {trend.get('signal_score_display')} | |
 
 #### 系统分析理由
 **买入理由**：
@@ -4819,7 +4879,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 价格位置(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
 | 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 系统评分 | {trend.get('signal_score_display')} | |
 
 #### 系统分析理由
 **支持因素**：

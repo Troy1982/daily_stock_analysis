@@ -434,6 +434,26 @@ class NotificationService(
         if not data_sources:
             return False
         lines.append(f"*📋 {labels['data_sources_label']}：{data_sources}*")
+        NotificationService._append_data_quality_limitations(lines, result, labels)
+        return True
+
+    @staticmethod
+    def _append_data_quality_limitations(
+        lines: List[str],
+        result: AnalysisResult,
+        labels: Dict[str, str],
+    ) -> bool:
+        """Render program-determined data limitations (never LLM text), e.g. TW foundation gaps."""
+        items = getattr(result, "data_quality_limitations", None)
+        if not isinstance(items, list):
+            return False
+        items = [str(item).strip() for item in items if str(item).strip()]
+        if not items:
+            return False
+        english = str(getattr(result, "report_language", "zh") or "zh").lower().startswith(("en", "ko"))
+        suffix = " (program-determined)" if english else "（程序判定）"
+        lines.append(f"**⚠️ {labels['data_limitations_label']}{suffix}**:")
+        lines.extend(f"- {item}" for item in items)
         return True
 
     def generate_aggregate_report(
@@ -1990,6 +2010,8 @@ class NotificationService(
         excerpt = self._public_phase_pack_excerpt(result, report_language)
         if excerpt:
             lines.extend([excerpt, ""])
+        if self._append_data_quality_limitations(lines, result, labels):
+            lines.append("")
 
         self._append_market_snapshot(lines, result)
 

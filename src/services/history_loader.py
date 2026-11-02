@@ -138,6 +138,33 @@ def _select_best_bars(db, stock_code: str, start: date, end: date, stock_identit
     return best_code, best_bars
 
 
+def _load_tw_history(
+    stock_code: str, days: int, target_date: Optional[date] = None
+) -> Optional[Tuple[Optional[pd.DataFrame], str]]:
+    """Return the TW foundation history for codes routed to Taiwan, else ``None``.
+
+    台股路由错误（歧义、后缀冲突、主档不可用）一律回 ``(None, "none")``：不以其他市场的同号资料代替。
+    """
+    from src.services.tw_market_data import analysis_bridge
+
+    if not analysis_bridge.is_tw_candidate(stock_code):
+        return None
+    try:
+        if analysis_bridge.recall(stock_code) is None and analysis_bridge.route_code(stock_code) is None:
+            return None
+    except analysis_bridge.TwRouteError as exc:
+        logger.warning("load_history_df(%s): %s", stock_code, exc)
+        return None, "none"
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("load_history_df(%s): TW route check failed: %s", stock_code, exc)
+        return None
+    try:
+        return analysis_bridge.load_history_df(stock_code, days, target_date)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("load_history_df(%s): TW foundation read failed: %s", stock_code, exc)
+        return None, "none"
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -166,6 +193,13 @@ def load_history_df(
 
     # Calendar-day buffer: ~1.8x trading days + margin for long holidays
     start = end - timedelta(days=int(days * 1.8) + 10)
+
+    # --- 0. 台股底座：只读 tw_* raw 可用列，不读 stock_daily、不回落 Yahoo ----------
+    # 日期边界与既有优先序一致：explicit target_date → frozen target → 不限（当下）。
+    tw_target = target_date if target_date is not None else get_frozen_target_date()
+    tw_history = _load_tw_history(stock_code, days, tw_target)
+    if tw_history is not None:
+        return tw_history
 
     # --- 1. DB lookup (canonical code, then prefix-stripped fallback) ------
     try:

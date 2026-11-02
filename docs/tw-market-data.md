@@ -406,7 +406,115 @@ outcomes = svc.update(["2330.TW", "6488.TWO"])                # 逐档 SyncOutco
 - 兴柜股不在支援范围；转上市前的兴柜历史若无生效区间证据标 `market_segment_uncertain`，不清洗、不改值（兴柜 `open` 为前一日均价）。
 - XTAI 不含临时休市（台风假）；需执行 `calendar sync` 发现冲突后以 `calendar override` 处理。
 - Yahoo 备援的限制见第 5、6.2 节。
-- 未接入既有分析主流程、Web、排程与通知；裸代号在既有分析流程中的港股/A 股判定维持原状。
+- 已接入既有分析主流程（见第 11 节）；Web K 线/历史图表、告警、回测、ETF 轮动等仍走既有 `DataFetcherManager` / `stock_daily` 路径，未接入排程与通知变更。
 - `FINMIND_TOKEN` 未注册进 Web 设置的 `config_registry`：注册需要 Web 端说明文案（`settingsHelp.ts`）与 Web 构建/截图验证，超出本阶段“不做前端”范围。在 `.env` 设定时，设置 API 的推断元数据仍将其视为敏感值（`is_sensitive=true`、密码栏位），与 `TUSHARE_TOKEN` 同等处理（有测试锁定）。
+
+## 11. 接入既有分析主流程（第二阶段）
+
+接入层为 `src/services/tw_market_data/analysis_bridge.py`，只做路由、转接与品质摘要，不重新实现底座规则。CLI（`main.py`）、API / Web 分析任务、Bot 共用 `StockAnalysisPipeline.process_single_stock`，接入点即在此。
+
+### 11.1 实际呼叫链
+
+```
+输入代号
+ → main.py 交易日过滤：analysis_bridge.route_market（台股按 XTAI 过滤；无法安全路由者保留给主流程回报）
+ → StockAnalysisPipeline.process_single_stock
+     → _route_tw_code → analysis_bridge.route_code（主档 + 既有股票索引）
+         ├─ 非台股 → 既有流程（fetch_and_save_stock_data / stock_daily / DataFetcherManager），完全不变
+         ├─ 路由错误 → 明确失败结果（success=False，不调用 LLM）
+         └─ 台股 → 代号正规化为 2330.TW / 6488.TWO
+     → _prepare_tw_analysis_data → analysis_bridge.prepare_analysis(as_of=current_time, target_date=断点续传目标日)
+         → TwMarketDataService.sync_daily(raw)（新资料 / 重验政策不变，一律以真实时钟同步）
+         → 以 as_of 只读视图评估：最近收盘日、来源预期日、新鲜度；日线只读 cutoff 之前的列
+         → daily_range（分析窗完整性）+ institution_block（sync_institutional + 截至 cutoff 的逐日评估）
+         → 可用列（ok/warning）转 DataFrame；资料暂存于本档执行期间（失败也暂存，保留台股身分）
+         → 准备异常或无可用 raw 日线 → 本档明确失败（不调用 LLM、不进 stock_daily / Yahoo 路径）
+     → analyze_stock
+         → 台股身分由路由决定，不依赖暂存是否存在；未准备资料即明确失败
+         → 不取 Yahoo 即时行情、不并入 raw 序列
+         → analysis_bridge.run_trend_analysis（只用底座可用列；讯号所需指标不足则不产生趋势结果）
+         → _get_analysis_context_with_market_fallback：today/yesterday 由底座列组成，附 tw_market_data 品质摘要
+         → get_fundamental_context：institution 区块由底座提供（同一份，不重抓）
+         → AnalysisContextBuilder：daily_bars 来源 tw_market_data:finmind:raw，限制代码进入数据质量提醒
+         → LLM prompt：「台股资料品质（程序判定）」区块
+         → _apply_tw_data_quality：data_sources 加 daily:tw:finmind:raw / tw_data:<status> / institution:<status>，
+           risk_warning 前置「资料限制（程序判定）」
+ → Agent 工具：history_loader.load_history_df 对台股只读底座可用列（不超过 explicit target_date / frozen target），
+  不读 stock_daily、不回落 Yahoo；路由错误回空；analyze_trend 工具对台股走同一套指标门槛
+```
+
+### 11.2 代号路由契约
+
+| 输入 | 结果 |
+| --- | --- |
+| `2330.TW`、`0050.TW`、`00878.TW` | 主档确认上市 → 台股（保留前导零） |
+| `6488.TWO` | 主档确认上柜 → 台股 |
+| `6488`（裸代号，仅主档有、既有股票索引无其他市场） | 台股 `6488.TWO` |
+| `2330`、`0050`、`00878`（裸代号，既有索引另有 `02330.HK`、`00050.HK`、`00878.HK`） | `ambiguous_market` 失败，提示改用 `2330.TW` 等完整代号 |
+| `2330.TWO`、`6488.TW` | `tw_suffix_conflict` 失败 |
+| `9999.TW` / 存托凭证等 | `tw_symbol_not_found` / `tw_unsupported_security` 失败 |
+| `600519`、`00700`、`HK00700`、`AAPL`、`7203.T`、`005930.KS` 等 | 不进入台股，既有判定不变 |
+
+- 裸代号不只靠位数判定：必须本机主档有此代号，且既有股票索引（`stocks.index.json`，港股以去前导零为键）没有其他市场的同号标的。
+- 裸代号路由**只读本机主档**，不为裸代号发网路请求；主档为空时裸代号维持既有市场判定（日志提示改用后缀或先 `master refresh`）。
+- 后缀代号需要主档：主档为空或超过 24 小时会尝试刷新；刷新失败且无快取 → `tw_master_unavailable` 失败；有快取 → 沿用并列入限制 `tw_master_cache_stale`。
+
+### 11.3 资料与品质政策
+
+- 只用 FinMind raw（`series_version=raw`）；不混接 provider、口径或版本。raw 不可用时即使存在 Yahoo `split_adjusted`，分析也明确失败并说明“未使用替代资料”（分析入口无替代口径开关，维持严格 raw）。
+- 台股不读写 `stock_daily`（避免与既有 Yahoo 列在 `(code, date)` 键上混合）；既有 `stock_daily` 中的台股旧列保留不动、不被分析使用。
+- 栏位转接：`open/high/low/close` 对应 FinMind `open/max/min/close`，`volume` = 成交股数（股），`amount` = 来源 `Trading_money`（缺则空，不以量×价代替），`pct_chg` 仅在前一列为日历上紧邻交易日时计算，`ma5/10/20` 以实际可用列滚动、样本不足为空。
+- invalid / uncertain 列排除于指标之外并列出日期；缺日不补零、不虚构交易日。
+- 日期边界：分析时间 `as_of` 依既有优先序取 `current_time`（naive 视为台北时间，与 `get_market_now` 一致；不晚于当下），未给为当下；读取上限 `cutoff = min(as_of 的最近收盘日, target_date)`。日线、最新价、品质摘要、法人区块都只看 cutoff 之前的列，新鲜度相对 `as_of` 判定（历史时点的“待发布/落后”按当时判断）。Agent 历史依 explicit `target_date` → frozen target 截断，暂存资料晚于目标日时重新以目标日评估。限制：以交易日界定，不还原“当时尚未抓到的修正值”（列为目前储存值）。
+- 相邻交易日：`pct_chg` 只在前一可用列为日历上的前一交易日（含周末、正式休市与本机覆写）时计算；最新列不紧邻时上下文不提供 `yesterday`、`price_change_ratio`、`volume_change_ratio`，改以 `previous_available_bar`（明示“非前一交易日”）呈现，并列入限制 `tw_latest_previous_not_adjacent`。
+- 缺日时的衍生讯号：相邻性在分析器产生讯号**之前**传入（`StockTrendAnalyzer.analyze(..., previous_session_known=False)`，其他市场预设 `True`，行为不变）。此时：
+  - `volume_ratio_5d` 保留原定义“当日量 / 前 5 笔可用列均量”，但这 5 笔跨越缺日，`volume_trend` 明示统计范围；
+  - `volume_status` 为 `量价方向不可判定`，不产生放量/缩量上涨或下跌；
+  - MACD 只保留水平状态（多头/空头），不输出当日金叉、死叉、零轴穿越；
+  - 量能分项缺输入，不以中性分代替：`signal_score`、`buy_signal` 为空（`None`），提示词显示“不可用（必要输入缺失）”，context pack 技术区块为 `partial` 并带 `trend_signal_withheld_missing_input`，Agent `analyze_trend` 同样回空值；Agent 失败时的趋势兜底不会把空评分转成买卖决策；
+  - 均线、乖离率、RSI、支撑压力与趋势排列以可用列计算（缺日已由 `tw_daily_missing_sessions` 揭露），不依赖单日方向，照常输出。
+- 交易日历为 XTAI 预定行事历 + 本机覆写；XTAI 不含台风等临时休市（实测 2026-07-10、2026-10-23），未执行 `calendar sync` / `calendar override` 时这些日期会被列为分析窗缺日（状态 partial）。
+- 分析窗为截至最新可用日线的 120 个交易日（不早于本机首笔日线）。指标所需有效列对应 `src/stock_analyzer.py` 实际周期：MA5 5、MA10 10、MA20 20、MA60 60、MACD(12,26,9) 35、RSI6 7、RSI12 13、RSI24 25、5 日量能 6、20 日支撑压力 20；趋势讯号/评分（`trend_signal`）依赖除 MA60 外全部项目，需 35 列。
+- 不可计算即不输出：少于 35 列不产生趋势结果（无趋势状态、评分、买卖讯号、支撑判断，上下文无 `trend_analysis`、context pack 技术块为 missing、prompt 无趋势区块）；35–59 列照常计算讯号，但 `ma60` 为空、不以 MA20 代替（MA60 不参与讯号）；上下文 `ma5/10/20` 样本不足者不出现。Agent `analyze_trend` 工具对台股使用同一门槛。
+- 新鲜度与分析窗完整性分开：`market_session_pending`（尚未到发布时间，状态 ok + 说明）、`pending_publication`（发布宽限内，来源尚未发布）、`delayed/stale`（来源真正落后）各有不同限制代码。
+
+| 限制代码 | 意义 | 使整体为 partial |
+| --- | --- | --- |
+| `tw_market_session_pending` | 市场已收盘、来源发布时间未到 | 否 |
+| `tw_daily_pending_publication` | 来源尚未发布预期日（宽限内） | 是 |
+| `tw_daily_delayed` / `tw_daily_stale` / `tw_daily_freshness_unknown` | 来源落后或无法判定 | 是 |
+| `tw_daily_missing_sessions` | 分析窗缺日（列出日期） | 是 |
+| `tw_daily_calendar_uncertain` | 分析窗有日历无法确认的日期 | 是 |
+| `tw_daily_rows_excluded` | 排除 invalid/uncertain 列 | 是 |
+| `tw_indicator_insufficient_rows` | 有效样本不足，部分指标不可计算且不输出 | 是 |
+| `tw_latest_previous_not_adjacent` | 最新列的前一可用列并非前一交易日 | 是 |
+| `tw_preparation_failed` | 资料准备异常（主档/日历/资料库/来源） | 分析失败 |
+| `tw_institution_unavailable` / `tw_institution_limited` | 法人不可用或改报较早完整日/不新鲜 | 是 |
+| `tw_master_cache_stale` | 主档刷新失败沿用快取 | 是 |
+| `raw_unavailable_substitute_not_used` | raw 不可用、替代口径未使用 | 分析失败 |
+
+- 整体状态：`failed`（无可用 raw 日线 → 不调用 LLM，结果 `success=false`、`data_sources=tw:unavailable`）/ `partial`（可分析但有上表限制）/ `ok`。
+- AI 不负责修补数值或判定品质：品质由程序产生，经 prompt 区块、context pack 数据质量提醒、结果 `data_sources`、`risk_warning` 与 `data_quality_limitations`（报告「数据限制（程序判定）」区块）呈现。
+- 持久化：`data_quality_limitations` 附加在 analysis history 的 `raw_result` JSON（不改表结构）；`risk_warning` 亦含同一段文字。Web 历史详情页目前不单独渲染该栏位。
+
+### 11.4 法人区块
+
+- 既有 `fundamental_context.institution` 区块改由底座提供，T86 / TPEx 仅作底座内的官方对照，不另外并列，避免重复。
+- 只回报最近一个逐日评估为 `complete` 的交易日；不完整、空值、单位未验证或不可加总的日期不回报数值（`partial`），无资料或来源失败为 `failed`。
+- 栏位语义沿用原 T86 / TPEx 区块：`foreign_net` 不含外资自营商、`dealer_net` 为自营商合计、`total_net` 为三大法人合计（含外资自营商，另以 `foreign_dealer_self_net` 列出，`total_is_official=false`）。另附 `unit_status`、`freshness`、`limitations`。
+- 其他市场不触及底座；`FUNDAMENTAL_FETCH_TIMEOUT_SECONDS=0` 与阶段逾时语义不变。
+
+### 11.5 操作
+
+```bash
+python scripts/tw_market_data.py master refresh          # 裸代号路由需要本机主档
+python main.py --stocks 2330.TW,6488,0050.TW --no-notify  # 裸 2330 / 0050 与港股同号，需加 .TW
+```
+
+### 11.6 相容性与回滚
+
+- A 股、港股、美股、日股、韩股：路由检查只对 4–6 位数字（可带 `.TW/.TWO`）做本机主档查询，不命中即走既有流程。
+- 行为变化：本机已载入台股主档后，与台股同号且被既有索引登记为港股/A 股的裸代号会报歧义并要求加市场代号。台股 ETF 编号 `00xxx` 与五位港股代号大量重叠，例如裸 `00700`（腾讯）与 `00700.TW`（富邦恒生国企）同号，此时港股请改用 `HK00700` 或 `0700.HK`；未载入台股主档的环境不受影响。`.TW/.TWO` 分析改用 FinMind raw，不再使用 Yahoo 日线与盘中即时价。
+- 回滚：移除 `analysis_bridge.py` 及 `pipeline.py`、`history_loader.py`、`analysis_context_builder.py`、`analyzer.py`、`main.py`、`data_provider/base.py` 的台股分支，`institution` 区块即恢复 `TwInstitutionalFetcher`（可由 git 还原 `data_provider/base.py` 与 `tests/test_tw_institution_report_wiring.py`）。不涉及资料表变更。
 
 回滚方式：删除 `scripts/tw_market_data.py`、`src/services/tw_market_data/`、`src/repositories/tw_market_repo.py`、三个 `data_provider/` 新模块与 `src/storage.py` 中的 `tw_*` 模型；`tw_*` 资料表为独立新表，可直接 `DROP TABLE`，不影响既有资料表。

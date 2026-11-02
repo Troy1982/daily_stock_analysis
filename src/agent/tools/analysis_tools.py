@@ -37,19 +37,32 @@ def _handle_analyze_trend(stock_code: str) -> dict:
     if not (stock_code and str(stock_code).strip()):
         return {"error": "stock_code is required"}
 
-    df = _fetch_trend_data(stock_code)
-    if df is None or df.empty:
-        return {"error": f"No historical data available for trend analysis on {stock_code}"}
+    # 台股底座：与主流程同一套指标门槛与日期边界（不可计算的指标与讯号不输出）。
+    from src.services.tw_market_data.analysis_bridge import tool_trend
 
-    if len(df) < 20:
-        return {"error": f"Insufficient data for trend analysis on {stock_code} (need >= 20 days)"}
-
-    analyzer = StockTrendAnalyzer()
     try:
-        result = analyzer.analyze(df, stock_code)
+        tw_trend = tool_trend(stock_code)
     except Exception:
-        logger.warning("analyze_trend(%s): Trend analysis failed", stock_code, exc_info=True)
+        logger.warning("analyze_trend(%s): TW foundation trend failed", stock_code, exc_info=True)
         return {"error": f"Trend analysis failed for {stock_code}"}
+    if tw_trend is not None:
+        result, tw_error = tw_trend
+        if tw_error:
+            return {"error": tw_error}
+    else:
+        df = _fetch_trend_data(stock_code)
+        if df is None or df.empty:
+            return {"error": f"No historical data available for trend analysis on {stock_code}"}
+
+        if len(df) < 20:
+            return {"error": f"Insufficient data for trend analysis on {stock_code} (need >= 20 days)"}
+
+        analyzer = StockTrendAnalyzer()
+        try:
+            result = analyzer.analyze(df, stock_code)
+        except Exception:
+            logger.warning("analyze_trend(%s): Trend analysis failed", stock_code, exc_info=True)
+            return {"error": f"Trend analysis failed for {stock_code}"}
 
     return {
         "code": result.code,
@@ -81,7 +94,7 @@ def _handle_analyze_trend(stock_code: str) -> dict:
         "rsi_24": round(result.rsi_24, 2),
         "rsi_status": result.rsi_status.value,
         "rsi_signal": result.rsi_signal,
-        "buy_signal": result.buy_signal.value,
+        "buy_signal": result.buy_signal.value if result.buy_signal is not None else None,
         "signal_score": result.signal_score,
         "signal_reasons": result.signal_reasons,
         "risk_factors": result.risk_factors,

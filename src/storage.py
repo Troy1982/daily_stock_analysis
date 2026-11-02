@@ -4035,6 +4035,8 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         data.update({
             'data_sources': getattr(result, 'data_sources', ''),
             'raw_response': getattr(result, 'raw_response', None),
+            # 程序判定的资料限制（例如台股底座缺日/过期/样本不足）；附加于 raw_result JSON，不改表结构。
+            'data_quality_limitations': list(getattr(result, 'data_quality_limitations', None) or []),
         })
         return data
 

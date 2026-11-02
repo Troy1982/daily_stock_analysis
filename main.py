@@ -505,8 +505,16 @@ def _compute_trading_day_filter(
 
     open_markets = get_open_markets_today()
     filtered_codes = []
+    from src.services.tw_market_data.analysis_bridge import route_market as route_tw_market
+
     for code in stock_codes:
-        mkt = get_market_for_stock(code)
+        # 台股底座路由优先：裸代号经主档确认为台股时按台股交易日过滤；
+        # 无法安全路由（歧义/冲突/主档不可用）的保留给主流程明确回报，不被其他市场休市静默跳过。
+        tw_market = route_tw_market(code)
+        if tw_market == "error":
+            filtered_codes.append(code)
+            continue
+        mkt = tw_market or get_market_for_stock(code)
         if mkt is None:
             # 指数 code（如 sh000016/csi930955/930955.CSI）的 get_market_for_stock
             # 返回 None，若直接 fail-open 保留，A 股休市日指数不会被过滤，破坏
