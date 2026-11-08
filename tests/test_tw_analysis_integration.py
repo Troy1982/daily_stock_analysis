@@ -21,7 +21,9 @@ from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
 
+from data_provider.base import DataFetcherManager
 from data_provider.finmind_client import FinMindTransientError
+from data_provider.realtime_types import ChipDistribution
 from src.analyzer import AnalysisResult, _format_tw_market_quality_section
 from src.core.pipeline import StockAnalysisPipeline
 from src.enums import ReportType
@@ -933,6 +935,206 @@ class AnalyzerPreviousSessionContractTest(unittest.TestCase):
         self.assertIn("不可判定", StockTrendAnalyzer().format_analysis(result))
 
 
+class _FakeFetcher:
+    """A source returning plausible data for any code, recording every query."""
+
+    priority = 1
+
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+
+    def is_available(self):
+        return True
+
+    def get_stock_name(self, code):
+        self.calls.append(("name", code))
+        return f"{self.name}同号名称"
+
+    def get_chip_distribution(self, code):
+        self.calls.append(("chip", code))
+        return ChipDistribution(code=code, date="2026-10-27", profit_ratio=0.8, avg_cost=99.0, concentration_90=0.1)
+
+
+class TwLookupIsolationTest(_Base):
+    """A-share name / chip sources are never queried for a confirmed TW security.
+
+    The real ``DataFetcherManager`` runs with fake sources that return plausible A-share data,
+    so a missing guard would both record a call and leak the value into the result.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.a_share = _FakeFetcher("AkshareFetcher")
+        self.manager = DataFetcherManager(fetchers=[self.a_share])
+        self.manager.get_fundamental_context = MagicMock(
+            return_value={"market": "tw", "coverage": {}, "source_chain": []}
+        )
+        self.pipeline.fetcher_manager = self.manager
+        self.pipeline.max_workers = 1
+        self.pipeline.notifier = MagicMock()
+        self.pipeline._save_local_report = MagicMock()
+        self.pipeline._send_notifications = MagicMock()
+        self.pipeline.config.single_stock_notify = False
+        self.pipeline.config.report_type = "simple"
+        self.pipeline.config.analysis_delay = 0
+
+    def test_pipeline_run_never_queries_a_share_sources(self):
+        spy = MagicMock(wraps=self.pipeline._build_legacy_analysis_artifacts)
+        self.pipeline._build_legacy_analysis_artifacts = spy
+
+        results = self.pipeline.run(["2330.TW", "6488.TWO", "0050.TW"], send_notification=False)
+
+        self.assertEqual(self.a_share.calls, [])
+        self.assertEqual({r.code: r.name for r in results}, {
+            "2330.TW": "台積電", "6488.TWO": "環球晶", "0050.TW": "元大台灣50",
+        })
+        for call in self.pipeline.analyzer.analyze.call_args_list:
+            context = call.args[0]
+            self.assertNotIn("chip", context)
+            self.assertNotIn("同号名称", str(context.get("stock_name")))
+        prompt = _prompt(self.llm_context())
+        self.assertIn("请勿编造获利比例", prompt)
+        self.assertNotIn("获利比例** | **", prompt)
+        pack = AnalysisContextBuilder.build(self._rebuild(spy))
+        self.assertEqual(pack.blocks["chip"].status.value, "not_supported")
+        self.assertEqual(pack.blocks["chip"].items["chip_distribution"].missing_reason, "chip_not_supported")
+
+    def _rebuild(self, spy):
+        analysis_bridge.remember(analysis_bridge.prepare_analysis(analysis_bridge.route_code("2330.TW"), refresh=False))
+        try:
+            return self.pipeline._build_legacy_analysis_artifacts(**dict(spy.call_args.kwargs, code="2330.TW"))
+        finally:
+            analysis_bridge.forget("2330.TW")
+
+    def test_no_notify_run_saves_locally_and_sends_nothing(self):
+        results = self.pipeline.run(["2330.TW"], send_notification=False)
+
+        self.pipeline._save_local_report.assert_called_once()
+        self.assertEqual(self.pipeline._save_local_report.call_args.args[0], results)
+        self.pipeline._send_notifications.assert_not_called()
+        self.assertEqual(self.pipeline.notifier.mock_calls, [])
+        self.pipeline.db.save_analysis_history.assert_called()
+
+    def test_bare_confirmed_code_never_reaches_a_share_sources(self):
+        with patch.object(analysis_bridge, "_other_market_listings", return_value=[]):
+            results = self.pipeline.run(["6488"], send_notification=False)
+        self.assertEqual(self.a_share.calls, [])
+        self.assertEqual([(r.code, r.name) for r in results], [("6488.TWO", "環球晶")])
+
+    def test_analysis_step_does_not_call_the_manager_lookups(self):
+        manager = MagicMock()
+        manager.get_fundamental_context.return_value = {"market": "tw", "coverage": {}, "source_chain": []}
+        self.pipeline.fetcher_manager = manager
+        self.analyze("2330.TW")
+        manager.get_chip_distribution.assert_not_called()
+        manager.get_stock_name.assert_not_called()
+        manager.get_realtime_quote.assert_not_called()
+
+    def test_batch_prefetch_excludes_tw_and_keeps_other_markets(self):
+        manager = MagicMock()
+        manager.prefetch_daily_klines.return_value = 0
+        manager.prefetch_realtime_quotes.return_value = 0
+        self.pipeline.fetcher_manager = manager
+        self.pipeline.process_single_stock = MagicMock(return_value=None)
+        others = ["600519", "000001", "AAPL", "MSFT", "hk00700"]
+
+        self.pipeline.run(["2330.TW", "6488.TWO", "2330", *others], send_notification=False)
+
+        manager.prefetch_daily_klines.assert_called_once_with(others, days=30)
+        manager.prefetch_realtime_quotes.assert_called_once_with(others)
+        manager.prefetch_stock_names.assert_called_once_with(others, use_bulk=False)
+
+    def test_all_tw_batch_skips_prefetch(self):
+        manager = MagicMock()
+        self.pipeline.fetcher_manager = manager
+        self.pipeline.process_single_stock = MagicMock(return_value=None)
+
+        self.pipeline.run(["2330.TW", "6488.TWO", "0050.TW", "00878.TW", "2330"], send_notification=False)
+
+        manager.prefetch_daily_klines.assert_not_called()
+        manager.prefetch_realtime_quotes.assert_not_called()
+        manager.prefetch_stock_names.assert_not_called()
+
+    def test_manager_uses_master_and_keeps_tw_out_of_a_share_fallback(self):
+        yahoo = _FakeFetcher("YfinanceFetcher")
+        manager = DataFetcherManager(fetchers=[self.a_share, yahoo])
+
+        self.assertEqual(manager.get_stock_name("2330.TW", allow_realtime=False), "台積電")
+        self.assertEqual(yahoo.calls, [])
+        # Not in the master: not confirmed, yet still never an A-share source.
+        self.assertEqual(manager.get_stock_name("9999.TW", allow_realtime=False), "YfinanceFetcher同号名称")
+        self.assertIsNone(manager.get_chip_distribution("2330.TW"))
+        self.assertIsNone(manager.get_chip_distribution("9999.TW"))
+        self.assertEqual(self.a_share.calls, [])
+
+    def test_other_markets_still_reach_their_sources(self):
+        with patch("src.config.get_config", return_value=SimpleNamespace(enable_chip_distribution=True)):
+            chip = self.manager.get_chip_distribution("600111")
+        self.assertEqual(chip.avg_cost, 99.0)
+        self.assertEqual(self.manager.get_stock_name("999111", allow_realtime=False), "AkshareFetcher同号名称")
+        self.assertEqual(self.a_share.calls, [("chip", "600111"), ("name", "999111")])
+
+    def test_agent_chip_tool_reports_not_supported_without_querying(self):
+        from src.agent.tools.data_tools import _handle_get_chip_distribution
+
+        with patch("src.agent.tools.data_tools._get_fetcher_manager", return_value=self.manager), \
+                patch.object(analysis_bridge, "_other_market_listings", return_value=[]):
+            for code in ("2330.TW", "6488"):
+                out = _handle_get_chip_distribution(code)
+                self.assertEqual(out["reason_code"], "tw_chip_not_supported")
+                self.assertNotIn("profit_ratio", out)
+        self.assertEqual(self.a_share.calls, [])
+
+    def test_agent_stock_info_name_comes_from_master(self):
+        from src.agent.tools.data_tools import _handle_get_stock_info
+
+        manager = MagicMock()
+        manager.get_fundamental_context.return_value = {"market": "tw", "coverage": {}, "source_chain": []}
+        manager.get_belong_boards.return_value = []
+        with patch("src.agent.tools.data_tools._get_fetcher_manager", return_value=manager), \
+                patch("src.agent.tools.data_tools.get_tool_analysis_target", return_value=None), \
+                patch.object(analysis_bridge, "_other_market_listings", return_value=[]):
+            out = _handle_get_stock_info("6488")
+        self.assertEqual(out["name"], "環球晶")
+        manager.get_stock_name.assert_not_called()
+
+    def test_agent_branch_removes_chip_tool_and_marks_chip_unavailable(self):
+        from src.agent.tools.registry import ToolDefinition, ToolParameter, ToolRegistry
+
+        registry = ToolRegistry()
+        for name in ("get_chip_distribution", "get_daily_history"):
+            registry.register(ToolDefinition(
+                name=name, description=name, category="data",
+                parameters=[ToolParameter(name="stock_code", type="string", description="code")],
+                handler=lambda **kw: {},
+            ))
+        executor = MagicMock()
+        executor.tool_registry = registry
+        executor.run.return_value = MagicMock(model="test-model", runtime_facts=None)
+        result = _llm_result("2330.TW", "台積電")
+        result.dashboard = {"data_perspective": {"chip_structure": {"profit_ratio": "85%"}}}
+        pipeline = self.pipeline
+        pipeline._load_persisted_intelligence_context = MagicMock(return_value=None)
+        pipeline._ensure_agent_history = MagicMock()
+        pipeline._load_agent_analysis_context = MagicMock(return_value={})
+        pipeline._build_analysis_context_pack_outputs = MagicMock(return_value=("", None))
+        pipeline._agent_result_to_analysis_result = MagicMock(return_value=result)
+        pipeline.config.agent_litellm_model = "test-model"
+        analysis_bridge.remember(analysis_bridge.prepare_analysis(analysis_bridge.route_code("2330.TW"), refresh=False))
+        try:
+            with patch("src.agent.factory.build_agent_executor", return_value=executor):
+                out = pipeline._analyze_with_agent(
+                    code="2330.TW", report_type=ReportType.SIMPLE, query_id="q", stock_name="台積電",
+                    realtime_quote=None, chip_data=None,
+                )
+        finally:
+            analysis_bridge.forget("2330.TW")
+        self.assertEqual(executor.tool_registry.list_names(), ["get_daily_history"])
+        self.assertEqual(out.dashboard["data_perspective"]["chip_structure"], {})
+        self.assertTrue(out.dashboard["data_perspective"]["chip_unavailable_reason"])
+
+
 class PersistenceTest(_Base):
     def test_raw_result_keeps_program_limitations(self):
         from src.storage import DatabaseManager
@@ -942,6 +1144,183 @@ class PersistenceTest(_Base):
         raw = DatabaseManager._build_raw_result(result)
         self.assertEqual(raw["data_quality_limitations"], result.data_quality_limitations)
         self.assertTrue(raw["data_quality_limitations"])
+
+
+class TwReportSemanticsGuardrailTest(_Base):
+    """The real pipeline rewrites no-news claims and keeps volume_ratio as the 5-bar ratio before saving."""
+
+    def _claiming_result(self, context, **_):
+        result = _llm_result(context["code"], context.get("stock_name"))
+        result.news_summary = "未搜索到相关新闻"
+        result.dashboard = {
+            "intelligence": {"latest_news": "未搜索到该股近3日相关新闻", "risk_alerts": ["近三日无负面消息"]},
+            "battle_plan": {"action_checklist": ["✅ 检查项4：无重大利空——没有重大利空"]},
+            "data_perspective": {"volume_analysis": {"volume_ratio": 9.99, "volume_meaning": "量比9.99倍"}},
+        }
+        return result
+
+    def test_pipeline_result_carries_corrected_news_and_volume_ratio(self):
+        self.pipeline.analyzer.analyze.side_effect = self._claiming_result
+
+        result = self.analyze("2330.TW")
+
+        expected_ratio = round(self.llm_context()["trend_analysis"]["volume_ratio_5d"], 2)
+        text = str(result.dashboard) + result.news_summary
+        for claim in ("未搜索到", "近三日无负面消息", "没有重大利空", "9.99"):
+            self.assertNotIn(claim, text)
+        self.assertFalse(result.news_evidence_present)
+        self.assertEqual(result.dashboard["intelligence"]["latest_news"], "本次未取得新闻，无法判断")
+        self.assertTrue(result.dashboard["battle_plan"]["action_checklist"][0].startswith("⚠️ 检查项4：无重大利空"))
+        volume = result.dashboard["data_perspective"]["volume_analysis"]
+        self.assertEqual(volume["volume_ratio"], expected_ratio)
+        self.assertEqual(volume["volume_ratio_basis"], "5d")
+        self.assertEqual(volume["volume_meaning"], f"5日量比{expected_ratio:.2f}")
+
+
+class TwValuationExcludesRealtimeQuoteTest(unittest.TestCase):
+    """The fundamental valuation block must not pull a Yahoo realtime quote for Taiwan codes."""
+
+    def _context(self, code):
+        manager = DataFetcherManager(fetchers=[])
+        manager.get_realtime_quote = MagicMock(
+            return_value=SimpleNamespace(pe_ratio=21.9, pb_ratio=7.86, total_mv=None, circ_mv=None)
+        )
+        bundle = ({}, None, 0, "fundamental_bundle_yfinance")
+        with patch.object(manager, "_fetch_offshore_fundamental_bundle", return_value=bundle):
+            context = manager.get_fundamental_context(code, budget_seconds=5)
+        return manager, context
+
+    def test_taiwan_valuation_is_unavailable_without_quote_call(self):
+        for code in ("2330.TW", "6488.TWO", "0050.TW"):
+            with self.subTest(code=code):
+                manager, context = self._context(code)
+                valuation = context["valuation"]
+
+                manager.get_realtime_quote.assert_not_called()
+                self.assertEqual(valuation["status"], "not_supported")
+                self.assertIsNone(valuation["data"]["pe_ratio"])
+                self.assertIsNone(valuation["data"]["pb_ratio"])
+                self.assertTrue(valuation["errors"][0].startswith("tw_realtime_quote_excluded"))
+                # No provider was consulted, so none is named (the reason stays in errors).
+                self.assertEqual(valuation["source_chain"], [])
+                self.assertNotIn(
+                    "tw_realtime_quote_excluded", [step["provider"] for step in context["source_chain"]]
+                )
+
+    def test_other_offshore_markets_keep_quote_valuation(self):
+        manager, context = self._context("AAPL")
+
+        manager.get_realtime_quote.assert_called_once()
+        self.assertEqual(context["valuation"]["data"]["pe_ratio"], 21.9)
+
+
+
+class _FakeYahooTicker:
+    """yfinance stand-in whose quote prices and ready-made yields are far from the FinMind close."""
+
+    QUOTE_PRICES = (9999.0, 8888.0, 7777.0)
+
+    def __init__(self, symbol):
+        import pandas as pd
+
+        self.symbol = symbol
+        self.quarterly_income_stmt = pd.DataFrame()
+        self.quarterly_cashflow = pd.DataFrame()
+        today = pd.Timestamp.now(tz="Asia/Taipei").normalize()
+        self.dividends = pd.Series(
+            [5.0, 6.0], index=pd.DatetimeIndex([today - pd.Timedelta(days=40), today - pd.Timedelta(days=130)])
+        )
+
+    def get_info(self):
+        current, market, previous = self.QUOTE_PRICES
+        return {
+            "currentPrice": current, "regularMarketPrice": market, "previousClose": previous,
+            "dividendYield": 4.321, "trailingAnnualDividendYield": 0.04321,
+            "currency": "TWD", "financialCurrency": "TWD", "revenueGrowth": 0.5,
+            "sector": "Technology", "industry": "Semiconductors",
+        }
+
+
+class TwYahooPriceExclusionTest(_Base):
+    """Yahoo quote prices / yields never reach a Taiwan derived metric, prompt, history or report."""
+
+    def _run(self, code):
+        manager = DataFetcherManager(fetchers=[])
+        manager.get_realtime_quote = MagicMock(side_effect=AssertionError("no realtime quote for Taiwan"))
+        self.pipeline.fetcher_manager.get_fundamental_context.side_effect = (
+            lambda c, **kw: manager.get_fundamental_context(c, budget_seconds=5)
+        )
+        def model_reply(context, **_):
+            result = _llm_result(context["code"], context.get("stock_name"))
+            result.data_sources = "基本面结构化数据（tw_realtime_quote_excluded）"
+            # The model invents turnover 0 and a "temporary" chip failure; neither is data.
+            result.dashboard = {"data_perspective": {
+                "volume_analysis": {"volume_ratio": 1.0, "volume_status": "平量", "turnover_rate": 0,
+                                    "volume_meaning": "-"},
+                "chip_structure": {"profit_ratio": "数据缺失"},
+            }}
+            return result
+
+        self.pipeline.analyzer.analyze.side_effect = model_reply
+        fake_yf = SimpleNamespace(Ticker=_FakeYahooTicker)
+        with patch.dict(sys.modules, {"yfinance": fake_yf}):
+            result = self.analyze(code)
+        return result, self.llm_context()
+
+    def test_yahoo_prices_do_not_flow_into_taiwan_dividend_yield(self):
+        from src.notification import NotificationService
+        from src.storage import DatabaseManager
+
+        for code in ("2330.TW", "6488.TWO", "0050.TW"):
+            with self.subTest(code=code):
+                result, context = self._run(code)
+                finmind_close = context["today"]["close"]
+                self.assertNotIn(finmind_close, _FakeYahooTicker.QUOTE_PRICES)
+
+                dividend = context["fundamental_context"]["earnings"]["data"]["dividend"]
+                self.assertEqual(dividend["ttm_cash_dividend_per_share"], 11.0)
+                self.assertIsNone(dividend["ttm_dividend_yield_pct"])
+                self.assertEqual(dividend["ttm_dividend_yield_unavailable_reason"], "quote_price_excluded")
+                self.assertEqual(result.current_price, finmind_close)
+
+                with patch("src.analyzer.GeminiAnalyzer._init_litellm", return_value=None):
+                    from src.analyzer import GeminiAnalyzer
+
+                    prompt = GeminiAnalyzer()._format_prompt(context, result.name, news_context=None)
+                self.assertIn("| TTM 股息率 | 不可用（不以 Yahoo 价格计算；请勿用任何价格自行推算） | 台股不提供 |", prompt)
+                self.assertIn("台股目前不支持筹码分布", prompt)
+
+                raw = DatabaseManager._build_raw_result(result)
+                report = NotificationService().generate_dashboard_report([result])
+                for stored in (str(raw), report, prompt):
+                    for price in ("9999", "8888", "7777", "4.32"):
+                        self.assertNotIn(price, stored)
+                self.assertIn("不可用（不以 Yahoo 价格计算）", report)
+                self.assertIn("换手率 无数据", report)
+                self.assertNotIn("换手率 0%", report)
+                # The fake supplies no statement values, so financials are not claimed as a source.
+                self.assertIn("；股利、成长指标、产业：Yahoo Finance", raw["data_sources"])
+                self.assertNotIn("财报", raw["data_sources"])
+                # Metadata-only financial report: not in the bundle, the source chain or the prompt.
+                fundamentals = context["fundamental_context"]
+                self.assertNotIn("financial_report", fundamentals["earnings"]["data"])
+                self.assertNotIn(
+                    "earnings.financial_report:yfinance",
+                    [step["provider"] for step in fundamentals["source_chain"]],
+                )
+                self.assertNotIn("financial_report", prompt)
+                self.assertIn("股利", raw["data_sources"])
+                self.assertIn("日线、三大法人：FinMind", report)
+                self.assertNotIn("tw_realtime_quote_excluded", raw["data_sources"])
+                self.assertIn("台股目前不支持筹码分布", report)
+                self.assertNotIn("暂不可用", report)
+
+    def test_other_markets_keep_the_yahoo_price_yield(self):
+        from data_provider.yfinance_fundamental_adapter import YfinanceFundamentalAdapter
+
+        with patch.dict(sys.modules, {"yfinance": SimpleNamespace(Ticker=_FakeYahooTicker)}):
+            bundle = YfinanceFundamentalAdapter().get_fundamental_bundle("AAPL")
+        self.assertEqual(bundle["earnings"]["dividend"]["ttm_dividend_yield_pct"], round(11.0 / 9999.0 * 100, 4))
 
 
 if __name__ == "__main__":

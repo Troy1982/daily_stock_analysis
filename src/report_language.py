@@ -322,6 +322,12 @@ _CHIP_UNAVAILABLE_BY_LANGUAGE = {
     "ko": "매물대가 비활성화되었거나 데이터 소스를 일시적으로 사용할 수 없어 매물대 신호를 반영하지 않았습니다.",
 }
 
+_CHIP_NOT_SUPPORTED_TW_BY_LANGUAGE = {
+    "zh": "台股目前不支持筹码分布（获利比例/平均成本/集中度），未纳入筹码判断。",
+    "en": "Chip distribution (profit ratio / average cost / concentration) is not supported for Taiwan stocks; chip signals were not used.",
+    "ko": "대만 주식은 현재 매물대(수익 비율/평균 원가/집중도)를 지원하지 않아 매물대 신호를 반영하지 않았습니다.",
+}
+
 _CHIP_PLACEHOLDER_EXACT = {
     "",
     "n/a",
@@ -446,6 +452,11 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "action_points_heading": "操作点位",
         "position_advice_heading": "持仓建议",
         "analysis_model_label": "分析模型",
+        "analysis_backend_label": "分析后端",
+        "model_unknown_label": "未知",
+        "no_data_label": "无数据",
+        "yield_quote_excluded_label": "不可用（不以 Yahoo 价格计算）",
+        "volume_ratio_5d_label": "量比(5日)",
         "not_investment_advice": "AI生成，仅供参考，不构成投资建议",
         "details_report_hint": "详细报告见",
         "financial_summary_heading": "财务摘要",
@@ -581,6 +592,11 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "action_points_heading": "Action Levels",
         "position_advice_heading": "Position Advice",
         "analysis_model_label": "Model",
+        "analysis_backend_label": "Backend",
+        "model_unknown_label": "Unknown",
+        "no_data_label": "No data",
+        "yield_quote_excluded_label": "Unavailable (not computed from a Yahoo price)",
+        "volume_ratio_5d_label": "Volume Ratio (5 bars)",
         "not_investment_advice": "AI-generated content for reference only. Not investment advice.",
         "details_report_hint": "See detailed report:",
         "financial_summary_heading": "Financial Summary",
@@ -716,6 +732,11 @@ _REPORT_LABELS: Dict[str, Dict[str, str]] = {
         "action_points_heading": "대응 가격대",
         "position_advice_heading": "보유 전략",
         "analysis_model_label": "분석 모델",
+        "analysis_backend_label": "분석 백엔드",
+        "model_unknown_label": "알 수 없음",
+        "no_data_label": "데이터 없음",
+        "yield_quote_excluded_label": "사용 불가 (Yahoo 가격으로 계산하지 않음)",
+        "volume_ratio_5d_label": "거래량비(5봉)",
         "not_investment_advice": "AI 생성 참고용이며 투자 권유가 아닙니다.",
         "details_report_hint": "상세 리포트 보기:",
         "financial_summary_heading": "재무 요약",
@@ -853,6 +874,11 @@ def get_no_data_text(language: Optional[str]) -> str:
 def get_chip_unavailable_text(language: Optional[str]) -> str:
     """Return the localized one-line chip distribution fallback text."""
     return _CHIP_UNAVAILABLE_BY_LANGUAGE[normalize_report_language(language)]
+
+
+def get_tw_chip_not_supported_text(language: Optional[str]) -> str:
+    """Taiwan has no chip distribution source: say "not supported", not "temporarily unavailable"."""
+    return _CHIP_NOT_SUPPORTED_TW_BY_LANGUAGE[normalize_report_language(language)]
 
 
 def _normalize_lookup_key(value: Any) -> str:

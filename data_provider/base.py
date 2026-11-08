@@ -2963,6 +2963,11 @@ class DataFetcherManager:
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
 
+        # 台股无筹码分布来源；现有来源只适用 A 股，不以同号 A 股资料代替。
+        if _market_tag(stock_code) == "tw":
+            logger.debug(f"[筹码分布] {stock_code} 是台股，无支援来源，跳过")
+            return None
+
         from .realtime_types import get_chip_circuit_breaker
         from src.config import get_config
 
@@ -3093,6 +3098,15 @@ class DataFetcherManager:
 
         # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+        is_tw = _market_tag(stock_code) == "tw"
+        if is_tw:
+            # 台股名称以底座主档为准；主档未确认时后续也只走可处理台股的来源。
+            from src.services.tw_market_data.analysis_bridge import confirmed_security
+
+            security = confirmed_security(stock_code)
+            if security is not None and is_meaningful_stock_name(security.name, stock_code):
+                return security.name
+
         static_name = STOCK_NAME_MAP.get(stock_code)
 
         # 1. 先检查缓存
@@ -3121,10 +3135,13 @@ class DataFetcherManager:
         from .akshare_fetcher import _is_us_code
         is_us = _is_us_code(stock_code)
         _US_CAPABLE_FETCHERS = {"YfinanceFetcher", "LongbridgeFetcher", "FinnhubFetcher", "AlphaVantageFetcher"}
+        _TW_CAPABLE_FETCHERS = {"YfinanceFetcher"}
         for fetcher in self._get_fetchers_snapshot():
             if not hasattr(fetcher, 'get_stock_name'):
                 continue
             if is_us and fetcher.name not in _US_CAPABLE_FETCHERS:
+                continue
+            if is_tw and fetcher.name not in _TW_CAPABLE_FETCHERS:
                 continue
             if not self._is_fetcher_available(fetcher, capability="stock_name"):
                 continue
@@ -3784,9 +3801,12 @@ class DataFetcherManager:
 
         config = get_config()
 
+        # Taiwan raw analysis never consumes a Yahoo quote price (or a yield derived from it).
+        bundle_kwargs: Dict[str, Any] = {"allow_quote_price": False} if market == "tw" else {}
+
         def _use_yfinance() -> Tuple[Dict[str, Any], Optional[str], int, str]:
             payload, err, ms = self._run_with_retry(
-                lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._yfinance_fundamental_adapter.get_fundamental_bundle(stock_code, **bundle_kwargs),
                 bundle_timeout,
                 "fundamental_bundle_yfinance",
             )
@@ -4006,8 +4026,16 @@ class DataFetcherManager:
 
         # Valuation: reuse realtime quote payload — yfinance returns pe/pb in the
         # same shape as AkShare, so the existing block formatter still works.
+        # Taiwan raw analysis must not consume a Yahoo realtime quote (or ratios derived
+        # from it), so the valuation block is marked unavailable instead of fetched.
         valuation_timeout = min(fetch_timeout, stage_timeout) if stage_timeout > 0 else 0
-        if valuation_timeout > 0:
+        if market == "tw":
+            quote_payload, valuation_err, valuation_ms = (
+                None,
+                "tw_realtime_quote_excluded: valuation needs a realtime quote, which Taiwan analysis does not use",
+                0,
+            )
+        elif valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code, **({"analysis_target": analysis_target} if analysis_target is not None else {})),
                 valuation_timeout,
@@ -4027,15 +4055,18 @@ class DataFetcherManager:
         )
         if valuation_status == "partial" and valuation_err and not self._has_meaningful_payload(valuation_payload):
             valuation_status = "failed"
+        # Taiwan: no provider was consulted, so the chain stays empty (the reason is in errors)
+        # instead of naming a pseudo-provider that would read as the fundamentals source.
+        valuation_chain = [] if market == "tw" else self._normalize_source_chain(
+            [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": valuation_ms}],
+            "realtime_quote",
+            valuation_status,
+            valuation_ms,
+        )
         result_ctx["valuation"] = self._build_fundamental_block(
             valuation_status,
             valuation_payload,
-            self._normalize_source_chain(
-                [{"provider": "realtime_quote", "result": valuation_status, "duration_ms": valuation_ms}],
-                "realtime_quote",
-                valuation_status,
-                valuation_ms,
-            ),
+            valuation_chain,
             [valuation_err] if valuation_err else [],
         )
 

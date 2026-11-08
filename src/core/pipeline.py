@@ -21,7 +21,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import List, Dict, Any, Optional, Tuple, Callable
+from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 
 import pandas as pd
 
@@ -65,6 +65,12 @@ from src.agent.news_evidence import (
     reset_news_evidence_scope,
 )
 from src.services.empty_news import news_evidence_present
+from src.services.financial_amounts import enforce_financial_amount_consistency
+from src.services.report_semantics_guardrail import (
+    enforce_no_news_wording,
+    enforce_volume_ratio_semantics,
+    enforce_tw_report_contract,
+)
 from src.formatters import strip_hidden_markdown_metadata
 from src.phase_decision_guardrail import apply_phase_decision_guardrails
 from src.services.daily_market_context import (
@@ -556,6 +562,8 @@ class StockAnalysisPipeline:
             chip_data = None
             if is_index and "chip_distribution" in INDEX_SKIP_MODULES:
                 logger.debug(f"{stock_name}({code}) 指数目标跳过筹码分布")
+            elif tw_data is not None:
+                logger.debug(f"{stock_name}({code}) 台股无筹码分布来源，标示为不可用")
             else:
                 try:
                     chip_data = self.fetcher_manager.get_chip_distribution(code)
@@ -922,6 +930,9 @@ class StockAnalysisPipeline:
             # Step 7.7: price_position fallback
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+                self._apply_report_semantics_guardrails(
+                    code, result, trend_result, enhanced_context, fundamental_context
+                )
                 action_source_advice = getattr(result, "operation_advice", None)
                 stabilize_decision_with_structure(result, trend_result, fundamental_context)
                 adjustments = apply_phase_decision_guardrails(
@@ -1110,6 +1121,8 @@ class StockAnalysisPipeline:
                 'bias_ma5': trend_result.bias_ma5,
                 'bias_ma10': trend_result.bias_ma10,
                 'volume_status': trend_result.volume_status.value,
+                # 当日量 / 前 5 笔可用列均量；不是较前一日的倍数（见 report_semantics_guardrail）。
+                'volume_ratio_5d': trend_result.volume_ratio_5d,
                 'volume_trend': trend_result.volume_trend,
                 'buy_signal': trend_result.buy_signal.value if trend_result.buy_signal is not None else None,
                 'signal_score': trend_result.signal_score,
@@ -1443,6 +1456,23 @@ class StockAnalysisPipeline:
         except Exception as e:
             logger.warning("[%s] Agent history prefetch failed: %s", code, e)
 
+    @staticmethod
+    def _agent_executor_without_tools(executor: Any, tool_names: Set[str]) -> Any:
+        """Return the executor with a registry that excludes ``tool_names``."""
+        registry = getattr(executor, "tool_registry", None)
+        if registry is None:
+            return executor
+        from src.agent.tools.registry import ToolRegistry as _TR
+        filtered = _TR(category_timeout_map=registry.category_timeout_map)
+        for name in registry.list_names():
+            if name in tool_names:
+                continue
+            tool_def = registry.get(name)
+            if tool_def is not None:
+                filtered.register(tool_def)
+        executor.tool_registry = filtered
+        return executor
+
     def _filter_agent_tools_for_index(self, executor: Any) -> Any:
         """Return an executor whose tool registry excludes index-incompatible tools.
 
@@ -1466,19 +1496,20 @@ class StockAnalysisPipeline:
             for name, modules in tool_modules.items()
             if INDEX_SKIP_MODULES.intersection(modules)
         }
-        registry = getattr(executor, "tool_registry", None)
-        if registry is None:
-            return executor
-        from src.agent.tools.registry import ToolRegistry as _TR
-        filtered = _TR(category_timeout_map=registry.category_timeout_map)
-        for name in registry.list_names():
-            if name in index_skip_tool_names:
-                continue
-            tool_def = registry.get(name)
-            if tool_def is not None:
-                filtered.register(tool_def)
-        executor.tool_registry = filtered
-        return executor
+        return self._agent_executor_without_tools(executor, index_skip_tool_names)
+
+    @staticmethod
+    def _apply_report_semantics_guardrails(
+        code: str, result: Any, trend_result: Any, context: Any, fundamental_context: Any = None
+    ) -> None:
+        """No-news wording, 5-bar volume ratio and labelled financial amounts (see module docs)."""
+        adjustments = (
+            enforce_no_news_wording(result)
+            + enforce_volume_ratio_semantics(result, trend_result, context if isinstance(context, dict) else None)
+            + enforce_financial_amount_consistency(result, fundamental_context)
+        )
+        if adjustments:
+            logger.info("[report_semantics_guardrail] Applied adjustments for %s: %s", code, adjustments)
 
     def _analyze_with_agent(
         self, 
@@ -1522,6 +1553,10 @@ class StockAnalysisPipeline:
             # 工具（筹码/基本面/资金流），确保 Agent 分支同样零调用（Story 1.5 V6）。
             if is_index:
                 executor = self._filter_agent_tools_for_index(executor)
+            # 台股无筹码来源：不提供该工具，Agent 分支同样零调用。
+            is_tw_security = self._tw_bridge().recall(code) is not None
+            if is_tw_security:
+                executor = self._agent_executor_without_tools(executor, {"get_chip_distribution"})
 
             # Build initial context to avoid redundant tool calls
             initial_context = {
@@ -1706,7 +1741,7 @@ class StockAnalysisPipeline:
                         missing,
                     )
             # chip_structure fallback (Issue #589), before save_analysis_history
-            if result and chip_data is not None:
+            if result and (chip_data is not None or is_tw_security):
                 normalize_chip_structure_availability(result, chip_data)
 
             # price_position fallback (same as non-agent path Step 7.7)
@@ -1732,6 +1767,9 @@ class StockAnalysisPipeline:
                 )
                 action_chain_valid = pipeline_start_action is not None
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+                self._apply_report_semantics_guardrails(
+                    code, result, trend_result, initial_context, fundamental_context
+                )
                 realtime_data = initial_context.get("realtime_quote", {})
                 if isinstance(realtime_data, dict):
                     result.current_price = realtime_data.get("price")
@@ -3159,9 +3197,14 @@ class StockAnalysisPipeline:
             metadata={
                 "query_id": query_id,
                 "trigger_source": self.query_source,
+                **self._chip_support_metadata(code),
             },
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
+
+    def _chip_support_metadata(self, code: str) -> Dict[str, bool]:
+        """台股无筹码来源：context pack 标示 not_supported，而非资料缺失。"""
+        return {"chip_not_supported": True} if self._tw_bridge().recall(code) is not None else {}
 
     def _build_agent_analysis_artifacts(
         self,
@@ -3209,6 +3252,7 @@ class StockAnalysisPipeline:
             metadata={
                 "query_id": query_id,
                 "trigger_source": self.query_source,
+                **self._chip_support_metadata(code),
             },
             portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
         )
@@ -3527,6 +3571,11 @@ class StockAnalysisPipeline:
         )
         return data
 
+    def _codes_outside_tw_foundation(self, stock_codes: List[str]) -> List[str]:
+        """排除走台股底座（含将回报路由错误）的代号；判定失败时维持既有行为。"""
+        bridge = self._tw_bridge()
+        return [code for code in stock_codes if bridge.route_market(code) is None]
+
     def _is_tw_identity(self, code: str, analysis_target: Optional[AnalysisTarget] = None) -> bool:
         """True when the code is (or must be treated as) a TW foundation code: never use legacy paths."""
         if self._tw_bridge().recall(code) is not None:
@@ -3568,15 +3617,20 @@ class StockAnalysisPipeline:
         data = self._tw_bridge().recall(code)
         if data is None:
             return
-        tokens = [item.strip() for item in (result.data_sources or "").split(",") if item.strip()]
-        for token in (
-            f"daily:{self._tw_bridge().DATA_SOURCE_TOKEN}",
-            f"tw_data:{data.status}",
-            f"institution:{data.institution.get('status')}",
-        ):
-            if token not in tokens:
-                tokens.append(token)
-        result.data_sources = ",".join(tokens)
+        # The source line is program-built from what each block actually used (the model's
+        # free-text source claim is replaced), followed by the machine tokens.
+        contract_adjustments = enforce_tw_report_contract(
+            result,
+            fundamental_context=getattr(result, "fundamental_context", None),
+            institution_status=data.institution.get("status"),
+            program_tokens=[
+                f"daily:{self._tw_bridge().DATA_SOURCE_TOKEN}",
+                f"tw_data:{data.status}",
+                f"institution:{data.institution.get('status')}",
+            ],
+        )
+        if contract_adjustments:
+            logger.info("[tw_report_contract] Applied adjustments for %s: %s", code, contract_adjustments)
         if not result.name or result.name == code:
             result.name = data.security.name
         latest_bar = data.latest.get("bar") or {}
@@ -3675,24 +3729,26 @@ class StockAnalysisPipeline:
         
         # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效
-        if len(stock_codes) >= 5:
-            daily_prefetch_count = self.fetcher_manager.prefetch_daily_klines(stock_codes, days=30)
+        # 台股底座代号不进入这些批量预取（来源与名称 fallback 只适用既有市场）。
+        prefetch_codes = self._codes_outside_tw_foundation(stock_codes)
+        if len(prefetch_codes) >= 5:
+            daily_prefetch_count = self.fetcher_manager.prefetch_daily_klines(prefetch_codes, days=30)
             if daily_prefetch_count > 0:
                 logger.info(
                     "[prefetch] component=daily_kline_prefetch action=complete "
                     "provider=TickFlowFetcher cached=%d stock_count=%d",
                     daily_prefetch_count,
-                    len(stock_codes),
+                    len(prefetch_codes),
                 )
 
-            prefetch_count = self.fetcher_manager.prefetch_realtime_quotes(stock_codes)
+            prefetch_count = self.fetcher_manager.prefetch_realtime_quotes(prefetch_codes)
             if prefetch_count > 0:
-                logger.info(f"已启用批量预取架构：一次拉取全市场数据，{len(stock_codes)} 只股票共享缓存")
+                logger.info(f"已启用批量预取架构：一次拉取全市场数据，{len(prefetch_codes)} 只股票共享缓存")
 
         # Issue #455: 预取股票名称，避免并发分析时显示「股票xxxxx」
         # dry_run 仅做数据拉取，不需要名称预取，避免额外网络开销
-        if not dry_run:
-            self.fetcher_manager.prefetch_stock_names(stock_codes, use_bulk=False)
+        if not dry_run and prefetch_codes:
+            self.fetcher_manager.prefetch_stock_names(prefetch_codes, use_bulk=False)
 
         # 单股推送模式（#55）：从配置读取
         single_stock_notify = getattr(self.config, 'single_stock_notify', False)

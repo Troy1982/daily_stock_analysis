@@ -1295,8 +1295,9 @@ def run_full_analysis(
         try:
             from src.feishu_doc import FeishuDocManager
 
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
+            # --no-notify 也涵盖对外发布：不建立、更新或分享云文档（本机报告与历史不受影响）。
+            feishu_doc = None if args.no_notify else FeishuDocManager()
+            if feishu_doc is not None and feishu_doc.is_configured() and (results or market_report):
                 logger.info("正在创建飞书云文档...")
 
                 # 1. 准备标题 "01-01 13:01大盘复盘"
@@ -1324,11 +1325,10 @@ def run_full_analysis(
                 if doc_url:
                     logger.info(f"飞书云文档创建成功: {doc_url}")
                     # 可选：将文档链接也推送到群里
-                    if not args.no_notify:
-                        pipeline.notifier.send(
-                            f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
-                            route_type="report",
-                        )
+                    pipeline.notifier.send(
+                        f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
+                        route_type="report",
+                    )
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")

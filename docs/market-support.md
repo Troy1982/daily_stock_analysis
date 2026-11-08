@@ -105,7 +105,7 @@ PY
 
 - **代号路由**：`.TW`/`.TWO` 以台股资料底座主档确认；裸代号仅在本机主档有此代号、且既有股票索引没有其他市场同号标的时进入台股（如 `6488`）。裸 `2330`、`0050`、`00878` 与港股同号，会回报歧义并要求加 `.TW`；本机主档为空时裸代号维持既有港股/A 股判定。`detect_market` / `get_market_for_stock` 本身仍仅在显式后缀时返回 `tw`。Web 自动补全仍不承诺完整台股股票池。
 - 分析主流程的台股日线来自[台股资料底座](tw-market-data.md)（FinMind raw，严格口径，不读写 `stock_daily`，不并入盘中即时价），品质、新鲜度、缺日与指标可计算性由程序判定并写入报告（详见该文档第 11 节）。Web K 线/历史图表、告警、回测等其他入口仍走 `YfinanceFetcher`。
-- 基本面复用既有 offshore yfinance 轻量路径；`institution` 区块改由台股资料底座提供（逐日完整性、单位验证、不重复加总；T86/TPEx 为底座内官方对照），A 股专属资金流、龙虎榜、板块等能力按 `not_supported` 降级。
+- 基本面复用既有 offshore yfinance 轻量路径；`institution` 区块改由台股资料底座提供（逐日完整性、单位验证、不重复加总；T86/TPEx 为底座内官方对照），A 股专属资金流、龙虎榜、板块、筹码分布等能力按 `not_supported` 降级。
 - 报告 Prompt 已增加台股市场语义（新台币、三大法人、TWSE/TPEx ±10% 涨跌停），并将三大法人净买卖超注入 LLM 分析上下文，避免套用 A 股北向资金、龙虎榜等概念。
 - 交易日历注册 `tw: XTAI / Asia/Taipei`。TWSE 为 09:00–13:30 连续交易、无午休；收盘集合竞价 13:25–13:30 已按 5 分钟启发式窗口建模（`_CLOSING_AUCTION_WINDOW_MINUTES["tw"]=5`，`market_phase` 可返回 `closing_auction`）。JP/KR 也已按常规交易时段补齐收盘集合竞价窗口（JP 15:25-15:30、KR 15:20-15:30）。若本地 `exchange-calendars` 版本缺少对应日历，既有 fail-open/fail-closed 语义保持不变。
 - 主要指数提供加权指数 `^TWII` 与柜买指数 `^TWOII`。

@@ -105,6 +105,66 @@ print(json.dumps({"prompt": prompt, "cwd": os.getcwd(), "sentiment_score": 70}, 
     assert "path" not in result.diagnostics["executable"]
 
 
+def test_claude_code_static_instruction_requires_raw_json_without_fences() -> None:
+    argv = CLAUDE_CODE_CLI_PRESET.argv
+    instruction = argv[argv.index("-p") + 1]
+
+    assert "exactly one raw JSON object" in instruction
+    assert "no Markdown code fences" in instruction
+    assert "If the request asks for JSON" in instruction
+
+
+def test_validation_failure_logs_reason_and_redacted_edges_only(tmp_path: Path, caplog) -> None:
+    backend = _backend(
+        tmp_path,
+        """
+print("Here is the analysis:")
+print("```json")
+print('{"sentiment_score": 70, "note": "' + "x" * 600 + '"}')
+print("```")
+print("OPENAI_API_KEY=sk-secret-value")
+""",
+    )
+
+    def reject(_text: str) -> None:
+        raise GenerationError(
+            error_code=GenerationErrorCode.INVALID_JSON,
+            stage="validation",
+            retryable=True,
+            fallbackable=True,
+            backend="generation_backend",
+            details={"reason": "ambiguous_json"},
+        )
+
+    with caplog.at_level("WARNING", logger="src.llm.local_cli_backend"):
+        with pytest.raises(GenerationError) as exc_info:
+            backend.generate("prompt", {}, response_validator=reject)
+
+    assert exc_info.value.details["reason"] == "ambiguous_json"
+    messages = [record.getMessage() for record in caplog.records if "failed validation" in record.getMessage()]
+    assert len(messages) == 1
+    message = messages[0]
+    assert "reason=ambiguous_json" in message
+    assert "fences=2" in message
+    assert "Here is the analysis" in message
+    assert "sk-secret-value" not in message
+    assert "x" * 600 not in message
+
+
+def test_validation_failure_logs_reason_for_non_generation_errors(tmp_path: Path, caplog) -> None:
+    backend = _backend(tmp_path, 'print("not json")')
+
+    with caplog.at_level("WARNING", logger="src.llm.local_cli_backend"):
+        with pytest.raises(GenerationError) as exc_info:
+            backend.generate("prompt", {}, response_validator=lambda text: json.loads(text))
+
+    assert exc_info.value.error_code == GenerationErrorCode.INVALID_JSON
+    assert any(
+        "failed validation" in record.getMessage() and "length=8" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_codex_preset_reads_output_last_message_instead_of_stdout(tmp_path: Path) -> None:
     final_payload = json.dumps({"prompt": "hello", "sentiment_score": 88, "source": "last_message"})
     script = _script(
@@ -1419,6 +1479,16 @@ def test_env_allowlist_and_denylist(monkeypatch) -> None:
     assert "WEBHOOK_TOKEN" not in child_env
     assert "WECOM_ENCODING_AES_KEY" not in child_env
     assert "AUTHORIZATION" not in child_env
+
+
+def test_build_local_cli_env_keeps_user_for_cli_login_lookup() -> None:
+    child_env = build_local_cli_env(
+        {"PATH": "/bin", "HOME": "/tmp/home", "USER": "tester", "ANTHROPIC_API_KEY": "sk-ant-secret"}
+    )
+
+    assert child_env["USER"] == "tester"
+    assert "ANTHROPIC_API_KEY" not in child_env
+
 
 
 def test_env_allowlist_preserves_windows_runtime_context() -> None:

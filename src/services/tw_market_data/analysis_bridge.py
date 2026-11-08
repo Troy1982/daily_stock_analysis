@@ -166,7 +166,7 @@ def _ensure_master(service) -> List[str]:
     return notes
 
 
-def route_code(code: str, service=None) -> Optional[TwRoute]:
+def route_code(code: str, service=None, *, refresh_master: bool = True) -> Optional[TwRoute]:
     """判定代号是否走台股底座。
 
     - 不像台股代号 → ``None``（既有市场逻辑不变）。
@@ -182,7 +182,7 @@ def route_code(code: str, service=None) -> Optional[TwRoute]:
     service = service or get_service()
     if suffix:
         try:
-            notes = _ensure_master(service)
+            notes = _ensure_master(service) if refresh_master else []
         except TwRouteError as exc:
             exc.code = query
             raise
@@ -233,6 +233,18 @@ def route_market(code: str) -> Optional[str]:
         return "error"
     except Exception:  # noqa: BLE001
         return "error" if "." in code else None
+
+
+def confirmed_security(code: str) -> Optional[SecurityRecord]:
+    """本机主档已确认的台股证券（不发网路请求）；未确认、歧义或后缀冲突回 ``None``。"""
+    if not is_tw_candidate(code):
+        return None
+    try:
+        route = route_code(code, refresh_master=False)
+    except Exception as exc:  # noqa: BLE001 - 确认失败只代表“未确认”，由呼叫端走既有判定
+        logger.debug("[tw-route] %s 未确认为台股: %s", code, exc)
+        return None
+    return route.security if route else None
 
 
 # ------------------------------------------------------------ analysis data

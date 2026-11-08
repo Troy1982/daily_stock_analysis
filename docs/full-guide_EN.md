@@ -117,7 +117,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `SINGLE_STOCK_NOTIFY` | Single stock push mode: set to `true` to push immediately after each stock analysis | Optional |
 | `REPORT_TYPE` | Report type: `simple` (concise), `full` (complete), `brief` (3-5 sentences), Docker recommended: `full` | Optional |
 | `REPORT_LANGUAGE` | Default output language for reports and Agent Chat: `zh` (default Chinese) / `en` (English) / `ko` (Korean); also updates prompt instructions, templates, notification fallbacks, fixed copy in the Web report view, and Ask Stock replies that omit `context.report_language`. `ko` reuses the English structural scaffolding and constrains the model to Korean output via an output-language directive; notifications render localized labels by report language. The bundled `00-daily-analysis.yml` already maps this variable, so setting it in Actions Secrets/Variables works out of the box | Optional |
-| `REPORT_SHOW_LLM_MODEL` | Whether notification report footers show the LLM model used for analysis. Defaults to `true`; set to `false` to hide runtime model metadata. This switch only affects presentation and does not change provider/model/Base URL, LiteLLM routing, or runtime model save/migration/cleanup behavior. | Optional |
+| `REPORT_SHOW_LLM_MODEL` | Whether notification report footers show the LLM model used for analysis. Defaults to `true`; set to `false` to hide runtime model metadata. This switch only affects presentation and does not change provider/model/Base URL, LiteLLM routing, or runtime model save/migration/cleanup behavior. With a local CLI generation backend (e.g. `claude_code_cli`) the footer shows the reported model plus the backend; when the CLI reports no model it shows "Unknown (Backend X)" and never presents the backend id as the model. | Optional |
 | `REPORT_TEMPLATES_DIR` | Jinja2 template directory (relative to project root, default `templates`) | Optional |
 | `REPORT_RENDERER_ENABLED` | Enable Jinja2 template rendering (default `false`, zero regression) | Optional |
 | `REPORT_INTEGRITY_ENABLED` | Enable report integrity checks, retry or placeholder on missing fields (default `true`) | Optional |
@@ -681,7 +681,7 @@ python main.py --no-market-review     # Stock analysis only
 python main.py --stocks 600519,300750 # Specify stocks
 python main.py --portfolio futu       # Use real Futu LONG stock holdings (overrides --stocks/STOCK_LIST)
 python main.py --dry-run              # Fetch data only, no AI analysis
-python main.py --no-notify            # Don't send notifications
+python main.py --no-notify            # No notifications or Feishu cloud docs (local reports and history still saved)
 python main.py --schedule             # Scheduled task mode
 python main.py --debug                # Debug mode (verbose logging)
 python main.py --workers 5            # Specify concurrency

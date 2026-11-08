@@ -243,7 +243,7 @@ class MainPortfolioTest(unittest.TestCase):
             no_market_review=True,
             workers=1,
             dry_run=False,
-            no_notify=True,
+            no_notify=False,
             schedule=False,
         )
         config = SimpleNamespace(

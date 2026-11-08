@@ -1100,6 +1100,8 @@ class HistoryService:
                 current_price=raw_result.get("current_price"),
                 change_pct=raw_result.get("change_pct"),
                 model_used=raw_result.get("model_used"),
+                generation_backend=raw_result.get("generation_backend"),
+                financial_amount_audit=list(raw_result.get("financial_amount_audit") or []),
             )
             guardrail_reason = extract_decision_guardrail_reason(raw_result)
             if guardrail_reason:

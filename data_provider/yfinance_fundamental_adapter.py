@@ -18,6 +18,9 @@ without changing downstream consumers. Adds HK/US-specific fields:
   trading currency (info.currentPrice/regularMarketPrice/previousClose).
   ``info.dividendYield`` is only used as a last-resort fallback and is
   passed through as-is (current yfinance reports it in percent units).
+  With ``allow_quote_price=False`` (Taiwan raw analysis) no Yahoo price or
+  Yahoo-supplied yield is used: the yield is left ``None`` and
+  ``ttm_dividend_yield_unavailable_reason`` says why.
 - ``belong_boards`` — derived from ``info.sector`` + ``info.industry``; the CN
   pipeline derives it from AkShare 板块名单, this is the HK/US analogue.
 
@@ -147,6 +150,17 @@ def _convert_to_yf_symbol(stock_code: str) -> str:
     return code
 
 
+# Fields that carry financial-statement data; ``report_date`` / ``currency`` are metadata.
+FINANCIAL_REPORT_VALUE_KEYS = ("revenue", "net_profit_parent", "operating_cash_flow", "roe")
+
+
+def has_financial_report_values(report: Any) -> bool:
+    """True when a financial report holds at least one substantive figure."""
+    if not isinstance(report, dict):
+        return False
+    return any(report.get(key) is not None and report.get(key) != "" for key in FINANCIAL_REPORT_VALUE_KEYS)
+
+
 class YfinanceFundamentalAdapter:
     """HK/US fundamental adapter backed by yfinance.
 
@@ -155,7 +169,8 @@ class YfinanceFundamentalAdapter:
     market-agnostic.
     """
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_fundamental_bundle(self, stock_code: str, *, allow_quote_price: bool = True) -> Dict[str, Any]:
+        """``allow_quote_price=False`` keeps Yahoo quote prices (and yields derived from them) out."""
         result: Dict[str, Any] = {
             "status": "not_supported",
             "growth": {},
@@ -274,7 +289,9 @@ class YfinanceFundamentalAdapter:
             "roe": growth_payload.get("roe"),
             "currency": financial_currency,
         }
-        if any(v is not None and v != "" for v in financial_report.values()):
+        # Only substantive values make a financial report: a currency label or a period with
+        # no figures (common for ETFs) is metadata, not data, and must not be claimed as a source.
+        if has_financial_report_values(financial_report):
             result.setdefault("earnings", {})["financial_report"] = financial_report
             result["source_chain"].append("earnings.financial_report:yfinance")
 
@@ -345,21 +362,27 @@ class YfinanceFundamentalAdapter:
             # currency). yfinance's `info.dividendYield` is now reported in
             # percent units, but past versions returned a ratio and some ADR
             # payloads still drift — keep it as a last-resort passthrough only.
-            latest_price = (
-                _safe_float(info.get("currentPrice"))
-                or _safe_float(info.get("regularMarketPrice"))
-                or _safe_float(info.get("previousClose"))
-            )
             yield_pct: Optional[float] = None
-            if ttm_cash is not None and latest_price not in (None, 0):
-                yield_pct = round(float(ttm_cash) / float(latest_price) * 100.0, 4)
-            elif _safe_float(info.get("trailingAnnualDividendYield")) is not None:
-                yield_pct = _ratio_to_pct(info.get("trailingAnnualDividendYield"))
+            if not allow_quote_price:
+                # Caller forbids Yahoo prices (Taiwan raw contract): no price-based or
+                # Yahoo-supplied yield; leave it empty rather than zero.
+                dividend_payload["ttm_dividend_yield_pct"] = None
+                dividend_payload["ttm_dividend_yield_unavailable_reason"] = "quote_price_excluded"
             else:
-                raw_yield = _safe_float(info.get("dividendYield"))
-                if raw_yield is not None:
-                    # Pass through as-is; current yfinance already returns percent.
-                    yield_pct = round(raw_yield, 4)
+                latest_price = (
+                    _safe_float(info.get("currentPrice"))
+                    or _safe_float(info.get("regularMarketPrice"))
+                    or _safe_float(info.get("previousClose"))
+                )
+                if ttm_cash is not None and latest_price not in (None, 0):
+                    yield_pct = round(float(ttm_cash) / float(latest_price) * 100.0, 4)
+                elif _safe_float(info.get("trailingAnnualDividendYield")) is not None:
+                    yield_pct = _ratio_to_pct(info.get("trailingAnnualDividendYield"))
+                else:
+                    raw_yield = _safe_float(info.get("dividendYield"))
+                    if raw_yield is not None:
+                        # Pass through as-is; current yfinance already returns percent.
+                        yield_pct = round(raw_yield, 4)
             if yield_pct is not None:
                 dividend_payload["ttm_dividend_yield_pct"] = yield_pct
             result.setdefault("earnings", {})["dividend"] = dividend_payload

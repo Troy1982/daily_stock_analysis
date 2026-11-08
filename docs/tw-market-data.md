@@ -465,6 +465,13 @@ outcomes = svc.update(["2330.TW", "6488.TWO"])                # 逐档 SyncOutco
 - 台股不读写 `stock_daily`（避免与既有 Yahoo 列在 `(code, date)` 键上混合）；既有 `stock_daily` 中的台股旧列保留不动、不被分析使用。
 - 栏位转接：`open/high/low/close` 对应 FinMind `open/max/min/close`，`volume` = 成交股数（股），`amount` = 来源 `Trading_money`（缺则空，不以量×价代替），`pct_chg` 仅在前一列为日历上紧邻交易日时计算，`ma5/10/20` 以实际可用列滚动、样本不足为空。
 - invalid / uncertain 列排除于指标之外并列出日期；缺日不补零、不虚构交易日。
+- 名称与筹码隔离：已确认的台股名称取自主档，批量预取（名称、即时行情、日线）排除台股底座代号；`.TW/.TWO` 主档未确认时名称 fallback 只走 Yahoo，不进 A 股来源。台股没有筹码来源：不查询、上下文无 `chip`、提示词与报告标示不可用、context pack 的 `chip` 区块为 `not_supported`；Agent 分支不提供 `get_chip_distribution`，直接呼叫回 `tw_chip_not_supported`。法人资料不受影响。
+- 估值隔离：基本面 `valuation` 区块原本以即时行情（台股为 Yahoo）取 PE/PB/市值；台股不呼叫即时行情，`valuation` 为 `not_supported`，原因 `tw_realtime_quote_excluded` 只记在 errors，`source_chain` 为空（未使用任何来源，不当作基本面来源名），提示词与报告不出现 Yahoo 推导的估值。
+- 殖利率隔离：Yahoo `info` 会带 `currentPrice` / `regularMarketPrice` / `previousClose` 与现成殖利率；台股一律不用。TTM 股息率为空（`ttm_dividend_yield_unavailable_reason=quote_price_excluded`），prompt 标示不可用并要求模型勿自行推算，报告显示“不可用（不以 Yahoo 价格计算）”。不改用 FinMind 收盘计算，因为 Yahoo 配息序列的期间与每股口径（分割调整）未验证与 FinMind raw 一致；无法确认即留空、不补零。每股现金分红、财报、成长指标与产业仍取自 Yahoo，并在来源列标明；财报只在有实质数值（营收、归母净利、经营现金流、ROE）时才算有资料，只有币别或报告期（如 ETF）不列为财报来源。
+- 来源列（程序判定）：台股报告的数据来源由程序依实际使用的区块产生，例如“日线、三大法人：FinMind；技术指标：程序依日线计算；财报、股利、成长指标、产业：Yahoo Finance；未使用：即时行情、估值（台股不使用 Yahoo 价格）”，后接机器标记（`daily:tw:finmind:raw` 等）；模型自写的来源说明不保留。
+- 换手率与筹码文字：台股底座没有换手率来源，模型填的换手率会被清空，报告显示“无数据”（不显示 0%；其他市场来源真的回传 0 时仍显示 0%）。筹码区块显示“台股目前不支持筹码分布”，不写成暂时查询失败。
+- 量能倍数：`volume_ratio` 标为“量比(5日)”（当日量 / 前 5 笔可用列均量）；较前一交易日只在日期相邻时写成“为前一交易日的 X 倍”，表达增减时写“增加约 Y%”，不写“放大 X 倍”。
+- 财务金额：prompt 中营收、归母净利、经营现金流以程序换算后的金额与单位提供（与财务表相同，如 `919776000000 TWD` → “9197.76 亿新台币”，并附原始值），模型不自行换算。保存前程序只改写能确认为本期绝对金额的写法（句中先有程序报告期锚点，锚点到金额之间只有已知的本期项目与分隔符，标签后为“为/达/约”等白名单字词，币别不冲突），并记录 `financial_amount_audit`（`corrected` / `unverified` 与原因 `period_unconfirmed`、`not_absolute_amount`、`currency_conflict`、`report_period_unknown`）；去年、其他季度、增减额与预测等无法确认者不改写，只在“数据限制（程序判定）”列出。价格、百分比与无单位数字不动，`raw_response` 保留模型原文。
 - 日期边界：分析时间 `as_of` 依既有优先序取 `current_time`（naive 视为台北时间，与 `get_market_now` 一致；不晚于当下），未给为当下；读取上限 `cutoff = min(as_of 的最近收盘日, target_date)`。日线、最新价、品质摘要、法人区块都只看 cutoff 之前的列，新鲜度相对 `as_of` 判定（历史时点的“待发布/落后”按当时判断）。Agent 历史依 explicit `target_date` → frozen target 截断，暂存资料晚于目标日时重新以目标日评估。限制：以交易日界定，不还原“当时尚未抓到的修正值”（列为目前储存值）。
 - 相邻交易日：`pct_chg` 只在前一可用列为日历上的前一交易日（含周末、正式休市与本机覆写）时计算；最新列不紧邻时上下文不提供 `yesterday`、`price_change_ratio`、`volume_change_ratio`，改以 `previous_available_bar`（明示“非前一交易日”）呈现，并列入限制 `tw_latest_previous_not_adjacent`。
 - 缺日时的衍生讯号：相邻性在分析器产生讯号**之前**传入（`StockTrendAnalyzer.analyze(..., previous_session_known=False)`，其他市场预设 `True`，行为不变）。此时：
