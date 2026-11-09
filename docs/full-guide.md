@@ -443,6 +443,8 @@ daily_stock_analysis/
 | `TW_YAHOO_FALLBACK_ENABLED` | FinMind 失败时另存 Yahoo `split_adjusted` 备援资料；raw 查询不会回传，须明确 `--allow-substitute`。 | `true` | 可选 |
 | `TW_DAILY_PUBLISH_TIME` / `TW_INSTITUTIONAL_PUBLISH_TIME` / `TW_SOURCE_DELAY_GRACE_HOURS` | 台股日线、个股法人的来源预期发布时间（Asia/Taipei，仅为预期）与待发布宽限时数。 | `17:30` / `20:00` / `6` | 可选 |
 | `TW_MARKET_CLOSURE_OVERRIDES` | 台股临时休市日（如台风假），逗号分隔 `YYYY-MM-DD`；亦可用 `calendar override` 写入本机资料库。 | - | 可选 |
+| `LINE_PUSH_ENV_FILES` | 台股 LINE 手动推送（`scripts/tw_line_push.py`）读取 LINE 凭证的 `.env` 路径，逗号分隔；只读 LINE token / 接收者键。留空沿用 line-push skill 顺序。详见 [tw-line-push.md](tw-line-push.md)。 | - | 可选 |
+| `TW_LINE_PUSH_DIR` | 台股 LINE 推送的预览与发送纪录目录。 | `~/.local/share/daily-stock-analysis/line_push` | 可选 |
 | `FUTU_HK_REALTIME_SOURCE_PRIORITY` | 港股实时行情独立优先级，可选 `futu`、`longbridge`、`akshare`、`yfinance`，按逗号分隔；失败自动回退。 | `futu,longbridge,akshare,yfinance` | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | Longbridge OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | - | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境使用 | - | 可选 |

@@ -51,6 +51,7 @@ google-search-results>=2.4.0  # SerpAPI
 
 # Network requests
 requests>=2.31.0            # HTTP requests
+opencc-python-reimplemented==0.1.7  # Simplified-to-Traditional (Taiwan) for scripts/tw_line_push.py
 markdown2>=2.4.0            # Markdown to HTML
 imgkit>=1.2.0              # Markdown to image; requires wkhtmltopdf
 fake-useragent>=1.4.0       # Random User-Agent support

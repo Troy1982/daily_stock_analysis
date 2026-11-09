@@ -379,6 +379,8 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 | `TW_YAHOO_FALLBACK_ENABLED` | Store Yahoo `split_adjusted` bars separately when FinMind fails; raw queries never return them unless `--allow-substitute` is passed. | `true` | Optional |
 | `TW_DAILY_PUBLISH_TIME` / `TW_INSTITUTIONAL_PUBLISH_TIME` / `TW_SOURCE_DELAY_GRACE_HOURS` | Expected source publish times (Asia/Taipei; expectations only) for Taiwan daily bars and per-stock institutional flows, plus the pending-publication grace period. | `17:30` / `20:00` / `6` | Optional |
 | `TW_MARKET_CLOSURE_OVERRIDES` | Ad-hoc Taiwan market closures (e.g. typhoon days), comma-separated `YYYY-MM-DD`; `calendar override` can also store them in the local DB. | - | Optional |
+| `LINE_PUSH_ENV_FILES` | Comma-separated `.env` paths the manual Taiwan LINE push (`scripts/tw_line_push.py`) reads LINE credentials from; only the LINE token / recipient keys are read. Empty = line-push skill order. See [tw-line-push.md](tw-line-push.md). | - | Optional |
+| `TW_LINE_PUSH_DIR` | Directory for Taiwan LINE push previews and the send ledger. | `~/.local/share/daily-stock-analysis/line_push` | Optional |
 | `TICKFLOW_BATCH_DAILY_ENABLED` | Enable TickFlow batch daily K-line prefetch when the current plan supports it; permission failures are negative-cached and fall back to per-stock providers. | `true` | Optional |
 | `TICKFLOW_BATCH_SIZE` | Maximum symbols per TickFlow batch request. | `100` | Optional |
 | `FUTU_OPEND_HOST` | Futu OpenD address; use an IPv4 address or an IPv4-resolvable hostname. Leave empty to disable Futu market data. | empty | Optional |

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 台股收盘分析 LINE Flex 手动推送（`scripts/tw_line_push.py`，详见 `docs/tw-line-push.md`）：只读指定的 `analysis_history` 结构化结果产生一则 carousel（第一张固定为大盘卡：加权指数与柜买指数的指数、涨跌、成交金额、最高 / 最低，日资料取自 FinMind，加权指数另画盘中每 20 分钟走势；之后每档一张：名称代号与资料日期、收盘价与成交量、涨跌额与涨跌幅、今日盘中每 20 分钟价格路径（Yahoo Finance 1 分钟、仅显示不进分析，终点为官方收盘，Flex 绘制）与最高 / 最低、RSI(6/12)、5 日量比与 RSI 状态（超买红 / 超卖绿）、外资/投信/自营商/合计法人净买卖超（万股）、报告中的主要风险、有新闻时才显示新闻；只在卡上显示影响当日数字可靠性的警示，其余品质说明与来源保存在预览明细），预设只产生预览（message JSON、繁体文字、近似视觉图），`--validate` 做唯读设定一致性、bot info 与 LINE validate 检查，`send --confirm` 才发送；沿用 line-push skill 的 LINE 设定但只读 token/接收者键，值冲突即停止；`X-Line-Retry-Key` 先持久化、每次最多 2 次尝试、只重试网络错误/timeout/5xx、同一报告已受理即跳过。一般分析不会自动推送。新增依赖 `opencc-python-reimplemented`，新增可选设定 `LINE_PUSH_ENV_FILES`、`TW_LINE_PUSH_DIR`。
+- [改进] 分析上下文快照的 `trend_analysis` 追加 `rsi_6`、`rsi_12`、`rsi_status`（未计算时为空，不以 0 代替）。
 - [修复] 个股分析 prompt 不再要求在 JSON 之外输出内容：股票名称改写入 `stock_name` 字段、“重点关注”的回答写入 JSON 字段（如 `action_checklist`），并明确只输出一个 JSON 对象、前后无说明且不用 Markdown 代码块；`claude_code_cli` 的固定指令同样要求请求 JSON 时只输出原始 JSON。修复 Claude Code 在 JSON 前后附加说明而被严格解析器判为 `ambiguous_json`、整档分析失败的问题；严格解析规则不变，不新增重试或 API fallback。
 - [修复] 本次未取得新闻（搜索未启用、未执行或零命中）时，分析 prompt 改为要求写“本次未取得新闻，无法判断”，并在结果保存与渲染前由程序改写“未搜索到新闻”“没有重大利空”“近 N 日无负面消息”等未经查证的说法（`latest_news` / `news_summary` 统一为该文案，检查清单的消息面项不再打 ✅）；有新闻证据时不改动。
 - [修复] `volume_ratio`（量比）明确为当日量 / 前 5 笔可用交易日均量：上下文与 prompt 提供程序计算的 `volume_ratio_5d` 及定义，较前一日倍数只来自日期相邻的 `volume_change_ratio`；结果中的 `volume_ratio` 以程序值为准，把 5 日量比写成“较前一日 X 倍”或非相邻日的前一日倍数会被改写。

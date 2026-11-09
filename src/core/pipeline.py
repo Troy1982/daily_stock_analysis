@@ -1124,6 +1124,9 @@ class StockAnalysisPipeline:
                 # 当日量 / 前 5 笔可用列均量；不是较前一日的倍数（见 report_semantics_guardrail）。
                 'volume_ratio_5d': trend_result.volume_ratio_5d,
                 'volume_trend': trend_result.volume_trend,
+                # RSI 数值随快照保存，供下游摘要（如 LINE 卡片）直接引用，不再从文字解析。
+                # 未计算（样本不足）时为 None，不以 dataclass 默认 0.0 冒充数值。
+                **self._rsi_snapshot(trend_result),
                 'buy_signal': trend_result.buy_signal.value if trend_result.buy_signal is not None else None,
                 'signal_score': trend_result.signal_score,
                 'signal_reasons': trend_result.signal_reasons,
@@ -1497,6 +1500,26 @@ class StockAnalysisPipeline:
             if INDEX_SKIP_MODULES.intersection(modules)
         }
         return self._agent_executor_without_tools(executor, index_skip_tool_names)
+
+    @staticmethod
+    def _rsi_snapshot(trend_result: Any) -> Dict[str, Any]:
+        """RSI(6/12) and status, or None when the analyzer did not compute RSI."""
+        computed = str(getattr(trend_result, "rsi_signal", "") or "") not in ("", "数据不足")
+
+        def value(name: str) -> Optional[float]:
+            raw = getattr(trend_result, name, None)
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                return None
+            return number if computed and number == number else None  # NaN -> None
+
+        status = getattr(trend_result, "rsi_status", None)
+        return {
+            "rsi_6": value("rsi_6"),
+            "rsi_12": value("rsi_12"),
+            "rsi_status": getattr(status, "value", None) if computed else None,
+        }
 
     @staticmethod
     def _apply_report_semantics_guardrails(

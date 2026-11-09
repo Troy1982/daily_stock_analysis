@@ -518,6 +518,10 @@ python scripts/tw_market_data.py master refresh          # 裸代号路由需要
 python main.py --stocks 2330.TW,6488,0050.TW --no-notify  # 裸 2330 / 0050 与港股同号，需加 .TW
 ```
 
+### 11.5.1 LINE 手动推送
+
+已保存的台股分析结果可整理成 LINE Flex carousel 手动预览与推送，见 [tw-line-push.md](tw-line-push.md)；一般分析不会自动推送。
+
 ### 11.6 相容性与回滚
 
 - A 股、港股、美股、日股、韩股：路由检查只对 4–6 位数字（可带 `.TW/.TWO`）做本机主档查询，不命中即走既有流程。
