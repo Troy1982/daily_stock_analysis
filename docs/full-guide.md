@@ -119,7 +119,7 @@ daily_stock_analysis/
 | `REPORT_TYPE` | 报告类型：`simple`(精简)、`full`(完整)、`brief`(3-5句概括)，Docker环境推荐设为 `full` | 可选 |
 | `REPORT_LANGUAGE` | 报告与 Agent Chat 的默认输出语言：`zh`(默认中文) / `en`(英文) / `ko`(韩文)；会同步影响 Prompt、模板、通知 fallback、Web 报告页固定文案，以及未显式传入 `context.report_language` 的问股回复。`ko` 复用英文结构骨架并通过输出语言指令约束模型用韩文输出，通知按报告语言渲染本地化标签。仓库自带 `00-daily-analysis.yml` 已显式映射该变量，直接在 Actions Secrets/Variables 中配置即可生效 | 可选 |
 | `REPORT_SUMMARY_ONLY` | 仅分析结果摘要：设为 `true` 时只推送汇总，不含个股详情；多股时适合快速浏览（默认 false，Issue #262） | 可选 |
-| `REPORT_SHOW_LLM_MODEL` | 通知报告底部是否显示本次分析使用的 LLM 模型名称，默认 `true`；设为 `false` 可隐藏运行时模型信息。该变量仅调整展示，不影响 provider/model/Base URL、LiteLLM 路由或运行时模型保存/迁移/清理语义。 | 可选 |
+| `REPORT_SHOW_LLM_MODEL` | 通知报告底部是否显示本次分析使用的 LLM 模型名称，默认 `true`；设为 `false` 可隐藏运行时模型信息。该变量仅调整展示，不影响 provider/model/Base URL、LiteLLM 路由或运行时模型保存/迁移/清理语义。使用本地 CLI 生成后端（如 `claude_code_cli`）时显示“实际模型（分析后端 X）”；CLI 未回报模型时显示“未知（分析后端 X）”，不把后端 id 当作模型名。 | 可选 |
 | `REPORT_TEMPLATES_DIR` | Jinja2 模板目录（相对项目根，默认 `templates`） | 可选 |
 | `REPORT_RENDERER_ENABLED` | 启用 Jinja2 模板渲染（默认 `false`，保证零回归） | 可选 |
 | `REPORT_INTEGRITY_ENABLED` | 启用报告完整性校验，缺失必填字段时重试或占位补全（默认 `true`） | 可选 |
@@ -437,6 +437,14 @@ daily_stock_analysis/
 | `TICKFLOW_KLINE_ADJUST` | TickFlow 日 K 复权模式：`none`、`forward`、`backward`、`forward_additive`、`backward_additive`。 | `none` | 可选 |
 | `TICKFLOW_BATCH_DAILY_ENABLED` | 是否启用 TickFlow 批量日 K 预取；权限不足会短期缓存失败状态，并继续走常规回退。 | `true` | 可选 |
 | `TICKFLOW_BATCH_SIZE` | TickFlow 日 K 与实时行情批量请求的单批最大标的数。 | `100` | 可选 |
+| `FINMIND_TOKEN` | 台股资料底座（`scripts/tw_market_data.py`）的 FinMind Token；不配置则使用匿名额度（300 次/小时），只以 `Authorization` 头发送。还原股价 `TaiwanStockPriceAdj` 需 FinMind Backer 以上。详见 [台股资料底座](tw-market-data.md)。 | - | 可选 |
+| `FINMIND_REQUESTS_PER_HOUR` / `FINMIND_TIMEOUT_SECONDS` / `FINMIND_MAX_RETRIES` | FinMind 本机每小时请求上限（`0`=自动：无 token 280、有 token 550）、逾时秒数、网络/5xx/429 有限重试次数（429 遵守 Retry-After，单次最多等 30 秒；402 额度用尽、本机预算用尽与权限不足不重试）。 | `0` / `20` / `2` | 可选 |
+| `TW_DAILY_BACKFILL_START` / `TW_DAILY_OVERLAP_DAYS` / `TW_REVALIDATE_HOURS` | 台股日线首次回补起始日、历史重验重叠交易日数、既有区间重验间隔（不限制新资料抓取）。 | `2015-01-01` / `5` / `20` | 可选 |
+| `TW_YAHOO_FALLBACK_ENABLED` | FinMind 失败时另存 Yahoo `split_adjusted` 备援资料；raw 查询不会回传，须明确 `--allow-substitute`。 | `true` | 可选 |
+| `TW_DAILY_PUBLISH_TIME` / `TW_INSTITUTIONAL_PUBLISH_TIME` / `TW_SOURCE_DELAY_GRACE_HOURS` | 台股日线、个股法人的来源预期发布时间（Asia/Taipei，仅为预期）与待发布宽限时数。 | `17:30` / `20:00` / `6` | 可选 |
+| `TW_MARKET_CLOSURE_OVERRIDES` | 台股临时休市日（如台风假），逗号分隔 `YYYY-MM-DD`；亦可用 `calendar override` 写入本机资料库。 | - | 可选 |
+| `LINE_PUSH_ENV_FILES` | 台股 LINE 手动推送（`scripts/tw_line_push.py`）读取 LINE 凭证的 `.env` 路径，逗号分隔；只读 LINE token / 接收者键。留空沿用 line-push skill 顺序。详见 [tw-line-push.md](tw-line-push.md)。 | - | 可选 |
+| `TW_LINE_PUSH_DIR` | 台股 LINE 推送的预览与发送纪录目录。 | `~/.local/share/daily-stock-analysis/line_push` | 可选 |
 | `FUTU_HK_REALTIME_SOURCE_PRIORITY` | 港股实时行情独立优先级，可选 `futu`、`longbridge`、`akshare`、`yfinance`，按逗号分隔；失败自动回退。 | `futu,longbridge,akshare,yfinance` | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | Longbridge OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | - | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境使用 | - | 可选 |
@@ -732,7 +740,7 @@ python main.py --etf-rotation         # ETF 轮动信号 + 规则回测（不调
 python main.py --stocks 600519,300750 # 指定股票
 python main.py --portfolio futu       # 使用 Futu 真实 LONG 正股持仓（覆盖 --stocks/STOCK_LIST）
 python main.py --dry-run              # 仅获取数据，不 AI 分析
-python main.py --no-notify            # 不发送推送
+python main.py --no-notify            # 不发送推送，也不建立飞书云文档（本地报告与历史照常）
 python main.py --schedule             # 定时任务模式
 python main.py --force-run            # 非交易日也强制执行（Issue #373）
 python main.py --debug                # 调试模式（详细日志）

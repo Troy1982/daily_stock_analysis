@@ -363,5 +363,48 @@ class YoyFromRowTest(unittest.TestCase):
         self.assertEqual(growth["net_profit_yoy"], -5.0)
 
 
+class TestFinancialReportNeedsSubstantiveValues(unittest.TestCase):
+    """A report with only metadata (currency, period) is not a financial report or a source."""
+
+    @staticmethod
+    def _etf_dividends() -> pd.Series:
+        now = pd.Timestamp.now(tz="Asia/Taipei").normalize()
+        return pd.Series(
+            [1.0, 0.6],
+            index=pd.DatetimeIndex([now - pd.Timedelta(days=30), now - pd.Timedelta(days=200)]),
+        )
+
+    def _bundle(self, info, income_df=None, code="0050.TW"):
+        ticker = _build_mock_ticker(info, income_df, dividends=self._etf_dividends())
+        with patch("yfinance.Ticker", return_value=ticker):
+            return YfinanceFundamentalAdapter().get_fundamental_bundle(code, allow_quote_price=False)
+
+    def test_currency_only_report_is_dropped_but_dividend_source_stays(self) -> None:
+        bundle = self._bundle({"currency": "TWD", "financialCurrency": "TWD", "currentPrice": 92.5})
+
+        self.assertNotIn("financial_report", bundle["earnings"])
+        self.assertNotIn("earnings.financial_report:yfinance", bundle["source_chain"])
+        dividend = bundle["earnings"]["dividend"]
+        self.assertAlmostEqual(dividend["ttm_cash_dividend_per_share"], 1.6)
+        self.assertIsNone(dividend["ttm_dividend_yield_pct"])
+        self.assertIn("earnings.dividend:yfinance", bundle["source_chain"])
+        self.assertEqual(bundle["status"], "partial")
+
+    def test_period_without_figures_is_dropped(self) -> None:
+        # Statement columns give a period, but no revenue / profit row exists.
+        income_df = pd.DataFrame({pd.Timestamp("2026-06-30"): {"Other Item": float("nan")}})
+
+        bundle = self._bundle({"currency": "TWD", "financialCurrency": "TWD"}, income_df)
+
+        self.assertNotIn("financial_report", bundle["earnings"])
+        self.assertNotIn("earnings.financial_report:yfinance", bundle["source_chain"])
+
+    def test_one_substantive_figure_keeps_the_report(self) -> None:
+        bundle = self._bundle({"currency": "TWD", "financialCurrency": "TWD", "returnOnEquity": 0.12}, code="2330.TW")
+
+        self.assertEqual(bundle["earnings"]["financial_report"]["roe"], 12.0)
+        self.assertIn("earnings.financial_report:yfinance", bundle["source_chain"])
+
+
 if __name__ == "__main__":
     unittest.main()

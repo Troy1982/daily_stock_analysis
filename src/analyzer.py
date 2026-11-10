@@ -15,7 +15,7 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple, Callable, Union
 
 import litellm
@@ -81,12 +81,14 @@ from src.llm.provider_cache import (
 from src.llm.response_content import strip_leading_think_wrapper
 from src.storage import persist_llm_usage
 from src.data.stock_mapping import STOCK_NAME_MAP
+from src.services.financial_amounts import format_amount_cn, format_amount_en
 from src.report_language import (
     get_signal_level,
     get_no_data_text,
     get_placeholder_text,
     get_unknown_text,
     get_chip_unavailable_text,
+    get_tw_chip_not_supported_text,
     infer_decision_type_from_advice,
     is_chip_placeholder_value,
     localize_chip_health,
@@ -873,6 +875,13 @@ def _sanitize_trend_analysis_for_prompt(
             else f"成交量较昨日变化约 {parsed_volume_change:.2f} 倍，可能存在异常数据或一次性冲量；量能信号必须降权解读，不能机械视为强确认。"
         )
 
+    # 分析器可能因输入不足而不输出综合评分/信号（None）；提示词中明确写“不可用”，不以 0 分代替。
+    unavailable_text = "Unavailable (required input missing)" if english else "不可用（必要输入缺失）"
+    if trend_dict.get("buy_signal", "") is None:
+        trend_dict["buy_signal"] = unavailable_text
+    score = trend_dict.get("signal_score", 0)
+    trend_dict["signal_score_display"] = unavailable_text if score is None else f"{score}/100"
+
     trend_dict["signal_reasons"] = signal_reasons
     trend_dict["risk_factors"] = risk_factors
     trend_dict["prompt_consistency_notes"] = prompt_notes
@@ -1038,6 +1047,14 @@ def fill_price_position_if_needed(
             logger.info("[price_position] Filled placeholder fields from computed data")
     except Exception as e:
         logger.warning("[price_position] Fill failed, skipping: %s", e)
+
+
+def _format_volume_ratio_5d(trend: Dict[str, Any], unknown_text: str) -> str:
+    """Prompt text for the 5-bar volume ratio; unavailable when not computed."""
+    value = _safe_float(trend.get("volume_ratio_5d"), default=math.nan)
+    if not math.isfinite(value) or value <= 0:
+        return unknown_text
+    return f"{value:.2f}"
 
 
 def stabilize_decision_with_structure(
@@ -1714,6 +1731,52 @@ def get_stock_name_multi_source(
     return f'股票{stock_code}'
 
 
+def _format_tw_market_quality_section(tw_market: Dict[str, Any], *, english: bool) -> str:
+    """Render the program-determined TW data-quality summary for the LLM prompt."""
+    latest = tw_market.get("latest") or {}
+    dates = latest.get("dates") or {}
+    fresh = latest.get("freshness") or {}
+    window = tw_market.get("analysis_window") or {}
+    indicators = tw_market.get("indicators") or {}
+    blocked = [name for name, item in indicators.items() if not item.get("computable")]
+    limitations = tw_market.get("limitation_texts") or []
+    if english:
+        lines = [
+            "",
+            "### Taiwan Data Quality (program-determined; do not repair or re-judge values)",
+            f"- Source: {tw_market.get('provider')} {tw_market.get('adjustment')} (series {tw_market.get('series_version')}); "
+            f"volume unit {tw_market.get('volume_unit')}, turnover {tw_market.get('turnover_unit')}; no intraday quote merged",
+            f"- Latest usable bar: {dates.get('actual_data_date')} | expected {dates.get('source_expected_date')} | "
+            f"market last closed {dates.get('market_last_closed_session')} | freshness {fresh.get('freshness')}",
+            f"- Analysis window {window.get('requested_start')}..{window.get('requested_end')}: {window.get('completeness')} "
+            f"({window.get('present_sessions')}/{window.get('expected_sessions')} sessions, {tw_market.get('usable_rows')} usable rows, "
+            f"missing {len(window.get('missing_dates') or [])})",
+            f"- Indicators not computable: {', '.join(blocked) or 'none'}",
+            f"- Overall data status: {tw_market.get('status')}",
+        ]
+        if limitations:
+            lines.append("- Limitations: " + "; ".join(limitations))
+        lines.append("> State these limitations in the report; never invent missing sessions or values.")
+    else:
+        lines = [
+            "",
+            "### 台股资料品质（程序判定，请勿自行修补或重新判定数值）",
+            f"- 来源：{tw_market.get('provider')} {tw_market.get('adjustment')}（序列 {tw_market.get('series_version')}）；"
+            f"成交量单位 {tw_market.get('volume_unit')}、成交金额 {tw_market.get('turnover_unit')}；未并入盘中即时价",
+            f"- 最新可用日线：{dates.get('actual_data_date')}｜来源预期 {dates.get('source_expected_date')}｜"
+            f"市场最近收盘 {dates.get('market_last_closed_session')}｜新鲜度 {fresh.get('freshness')}",
+            f"- 分析窗 {window.get('requested_start')}..{window.get('requested_end')}：{window.get('completeness')}"
+            f"（{window.get('present_sessions')}/{window.get('expected_sessions')} 交易日，可用 {tw_market.get('usable_rows')} 列，"
+            f"缺 {len(window.get('missing_dates') or [])} 日）",
+            f"- 不可计算指标：{'、'.join(blocked) or '无'}",
+            f"- 整体资料状态：{tw_market.get('status')}",
+        ]
+        if limitations:
+            lines.append("- 限制：" + "；".join(limitations))
+        lines.append("> 报告须明列上述限制；不得虚构缺漏交易日或数值。")
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class AnalysisResult:
     """
@@ -1781,6 +1844,10 @@ class AnalysisResult:
     # 「未纳入新闻面证据」。
     news_evidence_present: bool = False
     data_sources: str = ""  # 数据来源说明
+    # 程序判定的资料限制（非 LLM 产生，例如台股底座的缺日/过期/样本不足），报告直接呈现。
+    data_quality_limitations: List[str] = field(default_factory=list)
+    # 财务金额核对纪录（程序判定）：corrected = 已确认为本期绝对金额并改写；unverified = 不符但无法确认语意、未改写
+    financial_amount_audit: List[Dict[str, Any]] = field(default_factory=list)
     success: bool = True
     error_message: Optional[str] = None
 
@@ -1790,6 +1857,7 @@ class AnalysisResult:
 
     # ========== 模型标记（Issue #528）==========
     model_used: Optional[str] = None  # 分析使用的 LLM 模型（完整名，如 gemini/gemini-2.0-flash）
+    generation_backend: Optional[str] = None  # 本地 CLI 后端 id（如 claude_code_cli）；与 model_used 分开，不当模型名
 
     # ========== 历史对比（Report Engine P0）==========
     query_id: Optional[str] = None  # 本次分析 query_id，用于历史对比时排除本次记录
@@ -1839,6 +1907,8 @@ class AnalysisResult:
             'current_price': self.current_price,
             'change_pct': self.change_pct,
             'model_used': self.model_used,
+            'generation_backend': self.generation_backend,
+            'financial_amount_audit': list(self.financial_amount_audit or []),
             'market_structure_context': self.market_structure_context,
         }
 
@@ -1997,9 +2067,9 @@ class GeminiAnalyzer:
                 "resistance_level": 压力位价格
             },
             "volume_analysis": {
-                "volume_ratio": 量比数值,
+                "volume_ratio": 量比数值（当日量/前5笔可用交易日均量，不是较前一日倍数）,
                 "volume_status": "放量/缩量/平量",
-                "turnover_rate": 换手率百分比,
+                "turnover_rate": 换手率百分比（无数据时填 null，不要填 0）,
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
             },
             "chip_structure": {
@@ -2185,9 +2255,9 @@ class GeminiAnalyzer:
                 "resistance_level": 压力位价格
             },
             "volume_analysis": {
-                "volume_ratio": 量比数值,
+                "volume_ratio": 量比数值（当日量/前5笔可用交易日均量，不是较前一日倍数）,
                 "volume_status": "放量/缩量/平量",
-                "turnover_rate": 换手率百分比,
+                "turnover_rate": 换手率百分比（无数据时填 null，不要填 0）,
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
             },
             "chip_structure": {
@@ -2365,9 +2435,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 "resistance_level": resistance price
             },
             "volume_analysis": {
-                "volume_ratio": volume ratio number,
+                "volume_ratio": volume ratio number (today's volume / average of the previous 5 available bars; not a multiple of the previous day),
                 "volume_status": "High volume/Low volume/Normal volume",
-                "turnover_rate": turnover rate percentage,
+                "turnover_rate": turnover rate percentage (null when there is no data; never 0),
                 "volume_meaning": "Interpretation of volume (e.g. a low-volume pullback means selling pressure is easing)"
             },
             "chip_structure": {
@@ -4236,6 +4306,12 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 result.search_performed = bool(news_context)
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
+                if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+                    # A local CLI may not report its model: keep the backend id separately and
+                    # leave model_used empty ("unknown") rather than presenting the id as a model.
+                    result.generation_backend = backend_id
+                    if model_used in LOCAL_CLI_GENERATION_BACKEND_IDS:
+                        result.model_used = None
                 result.report_language = report_language
                 normalize_chip_structure_availability(result, context.get("chip"))
 
@@ -4519,24 +4595,51 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             financial_report = financial_report if isinstance(financial_report, dict) else {}
             dividend_metrics = dividend_metrics if isinstance(dividend_metrics, dict) else {}
             ttm_yield = dividend_metrics.get("ttm_dividend_yield_pct", "N/A")
+            yield_excluded = (
+                dividend_metrics.get("ttm_dividend_yield_unavailable_reason") == "quote_price_excluded"
+            )
+            yield_note_en = "Formula: TTM cash dividend per share / current price × 100%"
+            yield_note_zh = "公式：近12个月每股现金分红 / 当前价格 × 100%"
+            if yield_excluded:
+                yield_note_en = "Not provided for Taiwan stocks"
+                yield_note_zh = "台股不提供"
+                # Taiwan raw contract: no Yahoo price, so no yield; the model must not derive one.
+                ttm_yield = (
+                    "Unavailable (not computed from a Yahoo price; do not derive it from any price)"
+                    if english
+                    else "不可用（不以 Yahoo 价格计算；请勿用任何价格自行推算）"
+                )
             ttm_cash = dividend_metrics.get("ttm_cash_dividend_per_share", "N/A")
             ttm_count = dividend_metrics.get("ttm_event_count", "N/A")
             report_date = financial_report.get("report_date", "N/A")
+            report_currency = financial_report.get("currency")
+
+            def _amount_cell(field: str) -> str:
+                # Program-formatted amount (same formatter as the report table) next to the raw
+                # value, so the model quotes it instead of converting units itself.
+                value = financial_report.get(field)
+                if value is None:
+                    return "N/A"
+                if english:
+                    return f"{format_amount_en(value, report_currency)} (raw {value} {report_currency or ''})".replace(" )", ")")
+                formatted = format_amount_cn(value, report_currency)
+                return f"{formatted}（原始值 {value} {report_currency or ''}）".replace(" ）", "）")
             if english:
                 prompt += f"""
 ### Financials and Dividends (value-investing view)
 | Indicator | Value | Note |
 |------|------|------|
 | Latest Report Period | {report_date} | From structured financial report fields |
-| Revenue | {financial_report.get('revenue', 'N/A')} | |
-| Net Profit Attributable to Parent | {financial_report.get('net_profit_parent', 'N/A')} | |
-| Operating Cash Flow | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| Revenue | {_amount_cell('revenue')} | |
+| Net Profit Attributable to Parent | {_amount_cell('net_profit_parent')} | |
+| Operating Cash Flow | {_amount_cell('operating_cash_flow')} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | TTM Cash Dividend per Share | {ttm_cash} | Cash dividends only, pre-tax |
-| TTM Dividend Yield | {ttm_yield} | Formula: TTM cash dividend per share / current price × 100% |
+| TTM Dividend Yield | {ttm_yield} | {yield_note_en} |
 | TTM Dividend Events | {ttm_count} | |
 
 > If any field above is N/A or missing, state clearly "data unavailable, cannot judge"; never fabricate.
+> Quote amounts exactly as already converted above; do not convert units yourself.
 """
             else:
                 prompt += f"""
@@ -4544,15 +4647,16 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 指标 | 数值 | 说明 |
 |------|------|------|
 | 最近报告期 | {report_date} | 来自结构化财报字段 |
-| 营业收入 | {financial_report.get('revenue', 'N/A')} | |
-| 归母净利润 | {financial_report.get('net_profit_parent', 'N/A')} | |
-| 经营现金流 | {financial_report.get('operating_cash_flow', 'N/A')} | |
+| 营业收入 | {_amount_cell('revenue')} | |
+| 归母净利润 | {_amount_cell('net_profit_parent')} | |
+| 经营现金流 | {_amount_cell('operating_cash_flow')} | |
 | ROE | {financial_report.get('roe', 'N/A')} | |
 | 近12个月每股现金分红 | {ttm_cash} | 仅现金分红、税前口径 |
-| TTM 股息率 | {ttm_yield} | 公式：近12个月每股现金分红 / 当前价格 × 100% |
+| TTM 股息率 | {ttm_yield} | {yield_note_zh} |
 | TTM 分红事件数 | {ttm_count} | |
 
 > 若上述字段为 N/A 或缺失，请明确写“数据缺失，无法判断”，禁止编造。
+> 引用金额时直接照抄上表已换算好的金额与单位（如“9197.76 亿新台币”），不要自行换算万/百万/亿。
 """
 
         capital_flow_block = (
@@ -4622,6 +4726,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
 > 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。
 """
+
+        # 台股底座资料品质（程序判定）— tw-only，仅当上下文带 tw_market_data 时注入。
+        tw_market = context.get('tw_market_data')
+        if isinstance(tw_market, dict):
+            prompt += _format_tw_market_quality_section(tw_market, english=english)
 
         # 添加三大法人动向（台股筹码过滤器）— tw-only；仅当 institution 区块 status='ok'
         # 且有净额时注入，其他市场 status='not_supported' 会跳过，严格 additive。
@@ -4699,7 +4808,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | 筹码状态 | {chip.get('chip_status', unknown_text)} | |
 """
         else:
-            chip_unavailable_text = get_chip_unavailable_text(report_language)
+            chip_unavailable_text = (
+                get_tw_chip_not_supported_text(report_language)
+                if isinstance(context.get('tw_market_data'), dict)
+                else get_chip_unavailable_text(report_language)
+            )
             chip_instruction = (
                 "Do not fabricate profit ratio, average cost, or concentration. Mention chip data "
                 "unavailability only once in the report; do not repeat per-field no-data text in `chip_structure`."
@@ -4758,8 +4871,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | **{bias_label} (MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | {bias_label} (MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | Volume Status | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
+| Volume Ratio (5 bars) | {_format_volume_ratio_5d(trend, unknown_text)} | today's volume / average of the previous 5 available bars; not a multiple of the previous day |
 | System Signal | {trend.get('buy_signal', unknown_text)} | |
-| System Score | {trend.get('signal_score', 0)}/100 | |
+| System Score | {trend.get('signal_score_display')} | |
 
 #### System Analysis Reasons
 **{reasons_label}**:
@@ -4786,8 +4900,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
+| 量比(5日) | {_format_volume_ratio_5d(trend, unknown_text)} | 当日量/前5笔可用交易日均量，不是较前一日倍数 |
 | 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 系统评分 | {trend.get('signal_score_display')} | |
 
 #### 系统分析理由
 **买入理由**：
@@ -4818,8 +4933,9 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 | **价格位置(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
 | 价格位置(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
 | 量能状态 | {trend.get('volume_status', unknown_text)} | {trend.get('volume_trend', '')} |
+| 量比(5日) | {_format_volume_ratio_5d(trend, unknown_text)} | 当日量/前5笔可用交易日均量，不是较前一日倍数 |
 | 系统信号 | {trend.get('buy_signal', unknown_text)} | |
-| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+| 系统评分 | {trend.get('signal_score_display')} | |
 
 #### 系统分析理由
 **支持因素**：
@@ -4841,13 +4957,15 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             if english:
                 prompt += f"""
 ### Volume and Price Change
-- Volume vs. previous day: {volume_change}x
+- Today's volume is {volume_change}x the adjacent previous trading day's volume (this is not the 5-bar volume ratio)
+- Wording: write "N times the previous day's volume" or "up/down about Y%"; never "expanded N times". Label the 5-bar ratio and the previous-day multiple separately.
 - Price vs. previous day: {context.get('price_change_ratio', 'N/A')}%
 """
             else:
                 prompt += f"""
 ### 量价变化
-- 成交量较昨日变化：{volume_change}倍
+- 当日成交量为日期相邻前一交易日的 {volume_change} 倍（这不是 5 日量比）
+- 倍数写法：写“为前一交易日的X倍”；若表达增减幅度，写“增加约Y%”或“减少约Y%”；不得写“放大X倍”。5日量比与较前一交易日的倍数须分开标示。
 - 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
 """
             parsed_volume_change = _safe_float(volume_change, default=math.nan)
@@ -4921,11 +5039,11 @@ Below are the news search results for **{stock_name}({code})** from the last {ne
 """
         elif english:
             prompt += """
-No recent news was found for this stock. Base the analysis mainly on the technical data.
+No news was obtained in this run (news search was not enabled, not executed, or returned nothing), so the news angle cannot be judged. In `latest_news`, `news_summary`, the checklist and risk items write "No news was obtained in this run; cannot judge". Do not write "no news found", "no major negatives" or "no negative news in the last N days". Base the analysis mainly on the technical data.
 """
         else:
             prompt += """
-未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
+本次未取得新闻（新闻搜索未启用、未执行或无结果），无法判断消息面。`latest_news`、`news_summary`、检查清单与风险项涉及消息面时请写“本次未取得新闻，无法判断”，不得写“未搜索到新闻”“没有重大利空”或“近N日无负面消息”。请主要依据技术面数据进行分析。
 """
 
         # 注入缺失数据警告
@@ -4983,18 +5101,18 @@ Generate the Decision Dashboard for **{stock_name}({code})**, output strictly in
             prompt += f"""
 ### ⚠️ Important: output the correct stock name format
 The correct stock name format is "Stock name (stock code)", e.g. "Apple (AAPL)".
-If the stock name shown above is "Stock {code}" or incorrect, **state the correct company name explicitly** at the beginning of the analysis.
+If the stock name shown above is "Stock {code}" or incorrect, put the correct company name in the JSON `stock_name` field; do not state it outside the JSON.
 """
         else:
             prompt += f"""
 ### ⚠️ 重要：输出正确的股票名称格式
 正确的股票名称格式为“股票名称（股票代码）”，例如“贵州茅台（600519）”。
-如果上方显示的股票名称为"股票{code}"或不正确，请在分析开头**明确输出该股票的正确中文全称**。
+如果上方显示的股票名称为"股票{code}"或不正确，请在 JSON 的 `stock_name` 字段中填写该股票的正确中文全称，不要在 JSON 之外单独说明。
 """
         if english and use_legacy_default_prompt:
             prompt += """
 
-### Key focus (must be answered explicitly):
+### Key focus (must be answered explicitly inside the JSON fields such as `action_checklist`, not as separate text):
 1. ❓ Is the MA5>MA10>MA20 bullish alignment met?
 2. ❓ Is the current bias within the safe range (<5%)? — above 5% must be marked "do not chase"
 3. ❓ Does volume confirm (low-volume pullback/high-volume breakout)?
@@ -5004,7 +5122,7 @@ If the stock name shown above is "Stock {code}" or incorrect, **state the correc
         elif english:
             prompt += """
 
-### Key focus (must be answered explicitly):
+### Key focus (must be answered explicitly inside the JSON fields such as `action_checklist`, not as separate text):
 1. ❓ Does the current structure meet the key trigger conditions of the active skills?
 2. ❓ Are the current entry position and risk-reward reasonable? If the deviation is too large, state the waiting conditions explicitly
 3. ❓ Do volume, volatility and chip structure support the current conclusion?
@@ -5014,7 +5132,7 @@ If the stock name shown above is "Stock {code}" or incorrect, **state the correc
         elif use_legacy_default_prompt:
             prompt += f"""
 
-### 重点关注（必须明确回答）：
+### 重点关注（必须明确回答，答案写入 JSON 的对应字段如 `action_checklist`，不要在 JSON 之外单独作答）：
 1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
 2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
 3. ❓ 量能是否配合（缩量回调/放量突破）？
@@ -5024,7 +5142,7 @@ If the stock name shown above is "Stock {code}" or incorrect, **state the correc
         else:
             prompt += f"""
 
-### 重点关注（必须明确回答）：
+### 重点关注（必须明确回答，答案写入 JSON 的对应字段如 `action_checklist`，不要在 JSON 之外单独作答）：
 1. ❓ 当前结构是否满足激活技能的关键触发条件？
 2. ❓ 当前入场位置与风险回报是否合理？若偏离过大，请明确说明等待条件
 3. ❓ 量能、波动与筹码结构是否支持当前结论？
@@ -5043,7 +5161,7 @@ If the stock name shown above is "Stock {code}" or incorrect, **state the correc
 - **News time compliance**: `latest_news`, `risk_alerts` and `positive_catalysts` must not contain information older than the last {news_window_days} days or with an unknown date
 - **Technical consistency**: never use mutually exclusive conclusions such as "bearish alignment" and "bullish alignment" as valid evidence at the same time; if fundamentals/events conflict with technicals, state explicitly "event-led, technicals not yet confirmed" or "fundamentals lean positive, but technicals are not yet confirmed"
 
-Output the complete Decision Dashboard in JSON format."""
+Output the complete Decision Dashboard in JSON format. Output exactly one JSON object and nothing else: no text, headings or summary before or after it, and no Markdown code fences."""
         else:
             prompt += f"""
 
@@ -5056,7 +5174,7 @@ Output the complete Decision Dashboard in JSON format."""
 - **消息面时间合规**：`latest_news`、`risk_alerts`、`positive_catalysts` 不得包含超出近{news_window_days}日或时间未知的信息
 - **技术面一致性**：严禁把“空头排列”和“多头排列”等互斥结论同时当作有效依据；若基本面/事件面与技术面冲突，必须明确写“事件先行、技术待确认”或“基本面偏多，但技术面尚未确认”
  
-请输出完整的 JSON 格式决策仪表盘。"""
+请输出完整的 JSON 格式决策仪表盘。只输出一个 JSON 对象：JSON 之前和之后不得有任何说明、标题或总结，也不要使用 Markdown 代码块。"""
 
         if report_language == "en":
             prompt += """

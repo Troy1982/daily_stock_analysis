@@ -117,7 +117,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `SINGLE_STOCK_NOTIFY` | Single stock push mode: set to `true` to push immediately after each stock analysis | Optional |
 | `REPORT_TYPE` | Report type: `simple` (concise), `full` (complete), `brief` (3-5 sentences), Docker recommended: `full` | Optional |
 | `REPORT_LANGUAGE` | Default output language for reports and Agent Chat: `zh` (default Chinese) / `en` (English) / `ko` (Korean); also updates prompt instructions, templates, notification fallbacks, fixed copy in the Web report view, and Ask Stock replies that omit `context.report_language`. `ko` reuses the English structural scaffolding and constrains the model to Korean output via an output-language directive; notifications render localized labels by report language. The bundled `00-daily-analysis.yml` already maps this variable, so setting it in Actions Secrets/Variables works out of the box | Optional |
-| `REPORT_SHOW_LLM_MODEL` | Whether notification report footers show the LLM model used for analysis. Defaults to `true`; set to `false` to hide runtime model metadata. This switch only affects presentation and does not change provider/model/Base URL, LiteLLM routing, or runtime model save/migration/cleanup behavior. | Optional |
+| `REPORT_SHOW_LLM_MODEL` | Whether notification report footers show the LLM model used for analysis. Defaults to `true`; set to `false` to hide runtime model metadata. This switch only affects presentation and does not change provider/model/Base URL, LiteLLM routing, or runtime model save/migration/cleanup behavior. With a local CLI generation backend (e.g. `claude_code_cli`) the footer shows the reported model plus the backend; when the CLI reports no model it shows "Unknown (Backend X)" and never presents the backend id as the model. | Optional |
 | `REPORT_TEMPLATES_DIR` | Jinja2 template directory (relative to project root, default `templates`) | Optional |
 | `REPORT_RENDERER_ENABLED` | Enable Jinja2 template rendering (default `false`, zero regression) | Optional |
 | `REPORT_INTEGRITY_ENABLED` | Enable report integrity checks, retry or placeholder on missing fields (default `true`) | Optional |
@@ -373,6 +373,14 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 | `TICKFLOW_PRIORITY` | TickFlow priority for the generic A-share daily K-line route; lower values are tried earlier. No effect unless `TICKFLOW_API_KEY` is configured. Registered indices use a separate fixed chain and ignore this variable. Realtime quotes are ordered by `REALTIME_SOURCE_PRIORITY`. | `2` | Optional |
 | `TENCENT_PRIORITY` | Tencent direct priority for the generic A-share daily K-line route; lower values are tried earlier and `5` is the default last fallback. Registered indices use a separate fixed chain and ignore this variable. Does not affect realtime quotes. | `5` | Optional |
 | `TICKFLOW_KLINE_ADJUST` | TickFlow daily K-line adjustment mode: `none`, `forward`, `backward`, `forward_additive`, or `backward_additive`. | `none` | Optional |
+| `FINMIND_TOKEN` | FinMind token for the Taiwan market data foundation (`scripts/tw_market_data.py`); anonymous quota (300 requests/hour) is used when unset. Sent only in the `Authorization` header. Adjusted prices (`TaiwanStockPriceAdj`) require FinMind Backer or above. See [Taiwan market data foundation](tw-market-data.md) (Chinese). | - | Optional |
+| `FINMIND_REQUESTS_PER_HOUR` / `FINMIND_TIMEOUT_SECONDS` / `FINMIND_MAX_RETRIES` | Local hourly FinMind budget (`0` = auto: 280 without token, 550 with token), request timeout, and bounded retries for network/5xx/429 errors (429 honours Retry-After up to 30s; HTTP 402 quota, local budget and permission errors are never retried). | `0` / `20` / `2` | Optional |
+| `TW_DAILY_BACKFILL_START` / `TW_DAILY_OVERLAP_DAYS` / `TW_REVALIDATE_HOURS` | Taiwan daily backfill start date, overlap sessions re-fetched during revalidation, and revalidation interval (does not delay fetching newly expected sessions). | `2015-01-01` / `5` / `20` | Optional |
+| `TW_YAHOO_FALLBACK_ENABLED` | Store Yahoo `split_adjusted` bars separately when FinMind fails; raw queries never return them unless `--allow-substitute` is passed. | `true` | Optional |
+| `TW_DAILY_PUBLISH_TIME` / `TW_INSTITUTIONAL_PUBLISH_TIME` / `TW_SOURCE_DELAY_GRACE_HOURS` | Expected source publish times (Asia/Taipei; expectations only) for Taiwan daily bars and per-stock institutional flows, plus the pending-publication grace period. | `17:30` / `20:00` / `6` | Optional |
+| `TW_MARKET_CLOSURE_OVERRIDES` | Ad-hoc Taiwan market closures (e.g. typhoon days), comma-separated `YYYY-MM-DD`; `calendar override` can also store them in the local DB. | - | Optional |
+| `LINE_PUSH_ENV_FILES` | Comma-separated `.env` paths the manual Taiwan LINE push (`scripts/tw_line_push.py`) reads LINE credentials from; only the LINE token / recipient keys are read. Empty = line-push skill order. See [tw-line-push.md](tw-line-push.md). | - | Optional |
+| `TW_LINE_PUSH_DIR` | Directory for Taiwan LINE push previews and the send ledger. | `~/.local/share/daily-stock-analysis/line_push` | Optional |
 | `TICKFLOW_BATCH_DAILY_ENABLED` | Enable TickFlow batch daily K-line prefetch when the current plan supports it; permission failures are negative-cached and fall back to per-stock providers. | `true` | Optional |
 | `TICKFLOW_BATCH_SIZE` | Maximum symbols per TickFlow batch request. | `100` | Optional |
 | `FUTU_OPEND_HOST` | Futu OpenD address; use an IPv4 address or an IPv4-resolvable hostname. Leave empty to disable Futu market data. | empty | Optional |
@@ -675,7 +683,7 @@ python main.py --no-market-review     # Stock analysis only
 python main.py --stocks 600519,300750 # Specify stocks
 python main.py --portfolio futu       # Use real Futu LONG stock holdings (overrides --stocks/STOCK_LIST)
 python main.py --dry-run              # Fetch data only, no AI analysis
-python main.py --no-notify            # Don't send notifications
+python main.py --no-notify            # No notifications or Feishu cloud docs (local reports and history still saved)
 python main.py --schedule             # Scheduled task mode
 python main.py --debug                # Debug mode (verbose logging)
 python main.py --workers 5            # Specify concurrency

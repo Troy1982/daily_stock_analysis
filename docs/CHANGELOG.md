@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 台股收盘分析 LINE Flex 手动推送（`scripts/tw_line_push.py`，详见 `docs/tw-line-push.md`）：只读指定的 `analysis_history` 结构化结果产生一则 carousel（第一张固定为大盘卡：加权指数与柜买指数的指数、涨跌、成交金额、最高 / 最低，日资料取自 FinMind，加权指数另画盘中每 20 分钟走势；之后每档一张：名称代号与资料日期、收盘价与成交量、涨跌额与涨跌幅、今日盘中每 20 分钟价格路径（Yahoo Finance 1 分钟、仅显示不进分析，终点为官方收盘，Flex 绘制）与最高 / 最低、RSI(6/12)、5 日量比与 RSI 状态（超买红 / 超卖绿）、外资/投信/自营商/合计法人净买卖超（万股）、报告中的主要风险、有新闻时才显示新闻；只在卡上显示影响当日数字可靠性的警示，其余品质说明与来源保存在预览明细），预设只产生预览（message JSON、繁体文字、近似视觉图），`--validate` 做唯读设定一致性、bot info 与 LINE validate 检查，`send --confirm` 才发送；沿用 line-push skill 的 LINE 设定但只读 token/接收者键，值冲突即停止；`X-Line-Retry-Key` 先持久化、每次最多 2 次尝试、只重试网络错误/timeout/5xx、同一报告已受理即跳过。一般分析不会自动推送。新增依赖 `opencc-python-reimplemented`，新增可选设定 `LINE_PUSH_ENV_FILES`、`TW_LINE_PUSH_DIR`。
+- [改进] 分析上下文快照的 `trend_analysis` 追加 `rsi_6`、`rsi_12`、`rsi_status`（未计算时为空，不以 0 代替）。
+- [修复] 个股分析 prompt 不再要求在 JSON 之外输出内容：股票名称改写入 `stock_name` 字段、“重点关注”的回答写入 JSON 字段（如 `action_checklist`），并明确只输出一个 JSON 对象、前后无说明且不用 Markdown 代码块；`claude_code_cli` 的固定指令同样要求请求 JSON 时只输出原始 JSON。修复 Claude Code 在 JSON 前后附加说明而被严格解析器判为 `ambiguous_json`、整档分析失败的问题；严格解析规则不变，不新增重试或 API fallback。
+- [修复] 本次未取得新闻（搜索未启用、未执行或零命中）时，分析 prompt 改为要求写“本次未取得新闻，无法判断”，并在结果保存与渲染前由程序改写“未搜索到新闻”“没有重大利空”“近 N 日无负面消息”等未经查证的说法（`latest_news` / `news_summary` 统一为该文案，检查清单的消息面项不再打 ✅）；有新闻证据时不改动。
+- [修复] `volume_ratio`（量比）明确为当日量 / 前 5 笔可用交易日均量：上下文与 prompt 提供程序计算的 `volume_ratio_5d` 及定义，较前一日倍数只来自日期相邻的 `volume_change_ratio`；结果中的 `volume_ratio` 以程序值为准，把 5 日量比写成“较前一日 X 倍”或非相邻日的前一日倍数会被改写。
+- [修复] 台股基本面 `valuation` 区块不再呼叫 Yahoo 即时行情推导 PE/PB，改标 `not_supported`（`tw_realtime_quote_excluded`），维持台股 raw 分析不混入 Yahoo 即时价。
+- [修复] 台股 TTM 股息率不再使用 Yahoo `currentPrice` / `regularMarketPrice` / `previousClose` 或来源现成殖利率：基本面配接器对台股不计算殖利率（`ttm_dividend_yield_pct` 为空、`ttm_dividend_yield_unavailable_reason=quote_price_excluded`），prompt 标示不可用并禁止自行推算，报告显示“不可用（不以 Yahoo 价格计算）”；每股现金分红仍来自 Yahoo 并标明来源。
+- [修复] 台股报告的数据来源改由程序逐区块列出：日线／三大法人 FinMind、技术指标由程序依日线计算、财报／股利／成长指标／产业 Yahoo Finance，并注明未使用即时行情与估值；`valuation` 区块不再以 `tw_realtime_quote_excluded` 当作来源名（该原因只留在 errors）。
+- [修复] 换手率缺值显示“无数据”而非“0%”，来源确实回传 0 时仍显示 0%；台股无换手率来源，模型填入的数值会被清空。台股筹码文字改为“台股目前不支持筹码分布”，不再写成暂时查询失败。
+- [修复] 量能倍数统一精确表达：较前一交易日写成“为前一交易日的 X 倍”（增减幅度写“增加约 Y%”，模型写的“增加 X 倍”若与相邻日数值一致会改写为百分比），不写“放大 X 倍”；无即时行情量比时报告标为“量比(5日)”，与前一日倍数分开。有即时行情（A 股/港股/美股）时，`volume_ratio` 保留行情自带的量比，不再被改成 5 日量比。
+- [修复] 财务金额在摘要与财务表之间保持一致：分析 prompt 的营收、归母净利、经营现金流改为提供程序已换算的金额与单位（与报告财务表同一格式化函数，如“9197.76 亿新台币”，并附原始值），要求模型照抄、不自行换算万/百万/亿；英文 prompt 用英文金额格式（如 `919.78B TWD`）。结果保存与渲染前，程序只在能确认为“本期绝对金额”时改写：同一句须先指明程序的报告期（报告期日期、对应季度或“最新/最近报告期”“本期”），其后到该金额之间只能是已知的本期项目（其他财务金额、ROE/毛利率/同比等比率）与分隔符，标签与数字之间只能是“为/达/约”等白名单字词，币别不与财报冲突（单写“元”视为通用单位），且数值与程序值不符（容许四舍五入）时才改写为程序格式化金额。历史期间、其他季度、增减额、预测、累计期间等无法确认的写法一律不改，记为 `unverified`；改写与未核实纪录写入结果与历史的 `financial_amount_audit`（含原文、程序值、报告期与原因），未核实项另以程序文字列入报告“数据限制（程序判定）”；模型原始回覆（`raw_response`）照原样保留。
+- [修复] Yahoo 基本面的 `financial_report` 只在有实质财务数值（营收、归母净利、经营现金流、ROE）时才产生并列入来源；只有币别或报告期等中继栏位（常见于 ETF）时不再宣称有财报资料，prompt 的基本面来源与报告来源列不再出现 `earnings.financial_report:yfinance`，股利来源不受影响。
+- [改进] 本地 CLI 生成后端区分后端与实际模型：`claude_code_cli` 从 CLI JSON 回传的 `modelUsage` 读取并保存实际模型；未提供时 `model_used` 为空、报告显示“未知（分析后端 claude_code_cli）”，不再以后端 id 当作模型名。历史结果新增 `generation_backend` 字段。
+- [改进] 本地 CLI 生成后端的回复未通过调用方校验（如 `invalid_json`）时，日志记录失败原因、回复长度、代码块数量与脱敏后的首尾片段，便于排查；不记录完整回复，校验与失败语义不变。
+- [修复] 本地 CLI 生成后端的子进程环境保留 `USER`，修复 macOS 上 `claude_code_cli` 找不到 Claude 订阅登录、一律报 `login_required` 的问题；密钥类变量仍被过滤。
 - [修复] 自选及其他无关配置保存不再被已有 LLM 渠道或模型错误阻断，模型相关修改仍校验完整依赖；仅更新自选时保留运行时单例与容器环境覆盖，并补齐增删、删空和校验回归。凡本次保存会启用 Agent 路径的，同样校验完整模型依赖：切到 LiteLLM Agent 后端（`AGENT_BACKEND` / `AGENT_GENERATION_BACKEND` 解析为 litellm）、开启 Agent 分析（`AGENT_MODE=true`）、或配置了非 `all` 的 `AGENT_SKILLS`——后两者走普通分析的 Agent 分支，自带 `LLMToolAdapter`，不受 `AGENT_BACKEND` 决定。仅关闭 `AGENT_MODE`、将 `AGENT_SKILLS` 设为 `all` 或空值、以及无关键保存仍不受 LLM 配置影响；显式保存或导入已退役的 `codex_app_server` 仍被拒绝。
 - [改进] 移除实验性 Codex App Server 问股后端及专属探针、取消与启动链；旧配置明确提示退役并可主动修正，保留默认 LiteLLM、会话接受事务及独立 Codex CLI 报告。
 - [修复] Agent 状态面板在缺少可用主模型时显示中英文配置指引，保留技术错误码；配置指南明确区分已移除后端与历史 Gate 记录。
@@ -22,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 定时模式启动立即执行的当日去重（`SCHEDULE_STARTUP_DEDUP`，默认开启）：`python main.py --schedule` 在 `SCHEDULE_RUN_IMMEDIATELY=true` 触发启动补跑前检查标记文件（位于 `DATABASE_PATH` 所在目录，默认 `data/analysis_run_state.json`），当天已有成功且覆盖当前应分析清单的全量分析（日期 + scope=full + 覆盖面子集判定）则跳过，否则照常补跑；每日定时任务与手动/API/GitHub Actions 触发永不去重；标记缺失、损坏、schema 未知或覆盖不全一律 fail-open 执行（绝不漏跑）；大盘复盘完成度仅记录、不参与判定（复盘补齐由每日定时任务覆盖）；设 `SCHEDULE_STARTUP_DEDUP=false` 可回到此前"每次容器重启都全量重跑"的行为；`--force-run` 可绕过启动去重检查（明确要求立即全量分析）。
 - [修复] 收紧定时模式启动去重：仅当全部应分析标的都成功时才记录当日标记（部分失败或全败、即使大盘复盘成功也不得记录，避免重启漏跑）；跳过判定改为覆盖面子集校验并升版 schema 2（v1 旧标记一律 fail-open 重跑一次以升级），`SCHEDULE_STARTUP_DEDUP` 进程环境变量与 .env 值不同时以进程为准（与 `SCHEDULE_RUN_IMMEDIATELY` 同权）。
 - [修复] 定时模式启动去重检查的预期清单改为与运行入口一致的真实目标解析链（Futu 持仓优先、其次 .env 热更新 `STOCK_LIST`、再按交易日过滤）：`--portfolio futu` 新增持仓、纯持仓部署自选为空、以及进程 env 启动后 .env 热更新三类场景不再误跳过；持仓解析失败或解析为空一律 fail-open 照常执行（绝不漏跑），非持仓空清单保持既有当日去重语义。
+- [修复] `--no-notify` 现在也阻止建立、更新与分享飞书云文档；本地报告与分析历史不受影响。
+- [修复] 已确认的台股不再查询 A 股名称与筹码来源：名称取自主档，批量预取排除台股代号，筹码明确标示不可用（含 Agent 分支），避免同号 A 股资料进入分析上下文。
+- [新功能] 台股资料底座接入既有分析主流程：`.TW/.TWO` 与经本机主档确认的裸代号改用 FinMind raw 日线做技术与 AI 分析（不读写 `stock_daily`、不并入盘中即时价、不静默改用 Yahoo），与港股/A 股同号的裸代号（如 `2330`、`0050`）回报歧义并要求后缀；缺日、过期、待发布、样本不足、排除列与法人不完整由程序判定并写入报告 `data_sources` / 风险提示，无可用 raw 日线或资料准备异常时该档明确失败且不回落 `stock_daily`/Yahoo；日线、法人与品质摘要以分析时间与目标日为边界；有效样本不足的指标及其依赖讯号不输出（MA60 不以 MA20 代替）；缺日时不提供跨缺日的单日涨跌，且在讯号产生前停用依赖单日方向的量价状态与 MACD 当日交叉，综合评分与买入信号不输出（量比保留并标示含缺日）；`institution` 区块改由底座提供（栏位语义不变）；程序判定的限制写入报告并随 `raw_result` 保存；详见 `docs/tw-market-data.md` 第 11 节。
+- [新功能] 新增台股资料底座 `scripts/tw_market_data.py`：FinMind 为主来源的台股主档（代号/名称解析、TWSE/TPEx 由主档判定、保留 ETF 前导零）、日线与个股/全市场法人，含列品质、新鲜度与区间完整性状态，XTAI + 本机覆写交易日历，raw 查询不无声回传 Yahoo `split_adjusted`，还原序列以版本建置并通过日历/raw 参考范围与基准验证后原子切换（raw 参考只认成功且有回传的请求覆盖区间；正常追加也验证重叠证据、新区间与品质并以单一交易写入；Yahoo 新分割事件触发重建），法人逐日完整性与单位安全加总，缺漏重试按区间节流，FinMind 429 有限重试、402 额度用尽不重试，CLI 结束码逐项聚合，update/法人同步依本机实际内容判定空回应为 failed、落后为 partial，update 日线的抓取与 cache_hit 路径以同一验收范围（截至最近收盘日的重叠窗）判定并一律回传范围报告；新增可选 `FINMIND_TOKEN` 与 `TW_*` 设定，独立 `tw_*` 资料表，不改动既有分析流程，详见 `docs/tw-market-data.md`。
 
 ## [3.33.0] - 2026-10-15
 

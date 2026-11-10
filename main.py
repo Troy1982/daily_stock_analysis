@@ -505,8 +505,16 @@ def _compute_trading_day_filter(
 
     open_markets = get_open_markets_today()
     filtered_codes = []
+    from src.services.tw_market_data.analysis_bridge import route_market as route_tw_market
+
     for code in stock_codes:
-        mkt = get_market_for_stock(code)
+        # 台股底座路由优先：裸代号经主档确认为台股时按台股交易日过滤；
+        # 无法安全路由（歧义/冲突/主档不可用）的保留给主流程明确回报，不被其他市场休市静默跳过。
+        tw_market = route_tw_market(code)
+        if tw_market == "error":
+            filtered_codes.append(code)
+            continue
+        mkt = tw_market or get_market_for_stock(code)
         if mkt is None:
             # 指数 code（如 sh000016/csi930955/930955.CSI）的 get_market_for_stock
             # 返回 None，若直接 fail-open 保留，A 股休市日指数不会被过滤，破坏
@@ -1287,8 +1295,9 @@ def run_full_analysis(
         try:
             from src.feishu_doc import FeishuDocManager
 
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
+            # --no-notify 也涵盖对外发布：不建立、更新或分享云文档（本机报告与历史不受影响）。
+            feishu_doc = None if args.no_notify else FeishuDocManager()
+            if feishu_doc is not None and feishu_doc.is_configured() and (results or market_report):
                 logger.info("正在创建飞书云文档...")
 
                 # 1. 准备标题 "01-01 13:01大盘复盘"
@@ -1316,11 +1325,10 @@ def run_full_analysis(
                 if doc_url:
                     logger.info(f"飞书云文档创建成功: {doc_url}")
                     # 可选：将文档链接也推送到群里
-                    if not args.no_notify:
-                        pipeline.notifier.send(
-                            f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
-                            route_type="report",
-                        )
+                    pipeline.notifier.send(
+                        f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}",
+                        route_type="report",
+                    )
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")

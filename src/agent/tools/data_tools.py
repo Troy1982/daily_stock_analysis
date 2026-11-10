@@ -414,6 +414,14 @@ get_daily_history_tool = ToolDefinition(
 
 def _handle_get_chip_distribution(stock_code: str) -> dict:
     """Get chip distribution data."""
+    from src.services.tw_market_data.analysis_bridge import confirmed_security
+
+    if confirmed_security(stock_code) is not None:
+        return {
+            "error": f"Chip distribution is not supported for Taiwan security {stock_code}",
+            "reason_code": "tw_chip_not_supported",
+        }
+
     manager = _get_fetcher_manager()
     chip = manager.get_chip_distribution(stock_code)
 
@@ -517,9 +525,16 @@ def _handle_get_stock_info(stock_code: str) -> dict:
     sector_rankings = compact_context.get("boards", {}).get("data", {})
     belong_boards = manager.get_belong_boards(stock_code)
 
+    from src.services.tw_market_data.analysis_bridge import confirmed_security
+
     stock_name = stock_code.upper()
+    tw_security = confirmed_security(stock_code)
     try:
-        stock_name = manager.get_stock_name(stock_code, **({"analysis_target": target} if target is not None else {})) or stock_name
+        stock_name = (
+            tw_security.name
+            if tw_security is not None
+            else manager.get_stock_name(stock_code, **({"analysis_target": target} if target is not None else {})) or stock_name
+        )
     except Exception:
         pass
 

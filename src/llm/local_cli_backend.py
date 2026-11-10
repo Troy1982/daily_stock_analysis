@@ -14,6 +14,7 @@ import hashlib
 from contextlib import ExitStack, contextmanager
 from functools import lru_cache
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -48,6 +49,8 @@ MAX_LOCAL_CLI_TIMEOUT_SECONDS = 3600
 MAX_LOCAL_CLI_OUTPUT_BYTES = 32 * 1024 * 1024
 MAX_GENERATION_BACKEND_MAX_CONCURRENCY = 16
 MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY = 4
+
+logger = logging.getLogger(__name__)
 
 _PREVIEW_LIMIT = 800
 _FINAL_MESSAGE_OMITTED_PREVIEW = "<final-message omitted from stdout preview>"
@@ -96,6 +99,8 @@ _SENSITIVE_URL_KEY_PARTS = {
 _SAFE_ENV_EXACT = {
     "PATH",
     "HOME",
+    # macOS Claude Code CLI needs USER to find its subscription login in the Keychain.
+    "USER",
     "TMPDIR",
     "TEMP",
     "TMP",
@@ -424,7 +429,9 @@ _YAML_BLOCK_SCALAR_PATTERN = re.compile(r"^[|>][0-9+-]*$")
 _CLAUDE_CODE_STATIC_INSTRUCTION = (
     "Generate the requested DSA analysis output from stdin. "
     "Return only the final response content. Do not call tools, read files, "
-    "use MCP, or ask for interactive approval."
+    "use MCP, or ask for interactive approval. "
+    "If the request asks for JSON, output exactly one raw JSON object and nothing else: "
+    "no text before or after it and no Markdown code fences."
 )
 _PROMPT_FILE_PLACEHOLDER = "{prompt_file}"
 _OPENCODE_STATIC_INSTRUCTION = (
@@ -501,6 +508,8 @@ class LocalCliPreset:
     ).strip()
     contract_args: Sequence[str] = ()
     prompt_transport: str = "stdin"
+    # Reads the model the CLI says it used from raw stdout; None when the CLI does not say.
+    model_reporter: Optional[Callable[[str], Optional[str]]] = None
 
 
 CODEX_CLI_PRESET = LocalCliPreset(
@@ -552,6 +561,7 @@ CLAUDE_CODE_CLI_PRESET = LocalCliPreset(
     ),
     display_name="Claude Code CLI",
     extractor=lambda result: _extract_claude_code_json(result, schema_mode=False),
+    model_reporter=lambda stdout: _claude_code_reported_model(stdout),
     contract_args=(
         "--safe-mode",
         "--tools",
@@ -1695,6 +1705,23 @@ def _redact_authorization_fields(text: str) -> str:
     return _AUTHORIZATION_FIELD_PATTERN.sub(redact, text)
 
 
+def _log_validation_failure(preset_id: str, text: str, reason: Any) -> None:
+    """Log why a CLI reply failed the caller's validator, with redacted head/tail previews.
+
+    The full reply is never logged; only its length and bounded redacted edges.
+    """
+    text = text or ""
+    logger.warning(
+        "[LocalCLI] %s reply failed validation: reason=%s length=%d fences=%d head=%r tail=%r",
+        preset_id,
+        reason or "unknown",
+        len(text),
+        text.count("```"),
+        redact_diagnostic_text(text[:300], limit=300),
+        redact_diagnostic_text(text[-300:], limit=300) if len(text) > 300 else "",
+    )
+
+
 def redact_diagnostic_text(text: str, *, home: Optional[str] = None, limit: int = _PREVIEW_LIMIT) -> str:
     """Redact sensitive diagnostics and return a bounded preview.
 
@@ -1778,6 +1805,35 @@ def _has_sensitive_url_params(params_text: str) -> bool:
         if re.search(r"\b(sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|[A-Za-z0-9_-]{32,})\b", str(value or "")):
             return True
     return False
+
+
+def _claude_code_reported_model(stdout: str) -> Optional[str]:
+    """Model named in the ``--output-format json`` envelope, or None when it names none.
+
+    ``modelUsage`` maps model id -> token counts; with several entries the one that produced
+    the most output tokens is the answering model. A top-level ``model`` string is the
+    fallback. Nothing is guessed from the preset or the configuration.
+    """
+    try:
+        envelope = json.loads((stdout or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    usage = envelope.get("modelUsage")
+    if isinstance(usage, dict):
+        names = [name for name in usage if isinstance(name, str) and name.strip()]
+        if names:
+            def _output_tokens(name: str) -> float:
+                entry = usage.get(name)
+                value = entry.get("outputTokens") if isinstance(entry, dict) else None
+                return float(value) if isinstance(value, (int, float)) else 0.0
+
+            return max(names, key=_output_tokens).strip()
+    model = envelope.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return None
 
 
 def _extract_claude_code_json(result: LocalCliExecutionResult, *, schema_mode: bool) -> str:
@@ -2462,9 +2518,11 @@ class LocalCliGenerationBackend(GenerationBackend):
         if response_validator is not None:
             try:
                 response_validator(text)
-            except GenerationError:
+            except GenerationError as exc:
+                _log_validation_failure(self._preset.preset_id, text, exc.details.get("reason"))
                 raise
             except Exception as exc:
+                _log_validation_failure(self._preset.preset_id, text, str(exc) or "invalid_json")
                 raise self._error(
                     GenerationErrorCode.INVALID_JSON,
                     stage="validation",
@@ -2476,9 +2534,18 @@ class LocalCliGenerationBackend(GenerationBackend):
                     },
                 ) from exc
 
+        reported_model = None
+        if self._preset.model_reporter is not None:
+            try:
+                reported_model = self._preset.model_reporter(stdout)
+            except Exception:  # noqa: BLE001 - model reporting must never fail a valid reply
+                reported_model = None
+        diagnostics["reported_model"] = reported_model
         return GenerationResult(
             text=text,
-            model=self._preset.preset_id,
+            # The model the CLI reported; the preset id only when it reported none (callers
+            # treat a preset id as "model unknown", never as a model name).
+            model=reported_model or self._preset.preset_id,
             provider=self._preset.preset_id,
             backend=self.backend_id,
             usage={

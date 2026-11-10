@@ -395,4 +395,6 @@ class TwInstitutionalFetcher:
             "dealer_net": dealer,
             # Official total when present; otherwise the component sum (kept consistent).
             "total_net": total if total is not None else foreign + trust + dealer,
+            # Lets callers that must not mix official and derived figures tell them apart.
+            "total_is_official": total is not None,
         }

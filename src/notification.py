@@ -37,6 +37,7 @@ from src.notification_noise import (
     record_notification_noise,
     release_notification_noise,
 )
+from src.services.financial_amounts import CURRENCY_SUFFIX, format_amount_cn, unverified_amount_notes
 from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
@@ -434,6 +435,28 @@ class NotificationService(
         if not data_sources:
             return False
         lines.append(f"*📋 {labels['data_sources_label']}：{data_sources}*")
+        NotificationService._append_data_quality_limitations(lines, result, labels)
+        return True
+
+    @staticmethod
+    def _append_data_quality_limitations(
+        lines: List[str],
+        result: AnalysisResult,
+        labels: Dict[str, str],
+    ) -> bool:
+        """Render program-determined data limitations (never LLM text), e.g. TW foundation gaps."""
+        items = getattr(result, "data_quality_limitations", None)
+        items = list(items) if isinstance(items, list) else []
+        # Amounts that disagree with the report but could not be confirmed as current-period
+        # absolute amounts are left as written; say so here (program text, never model text).
+        items += unverified_amount_notes(result)
+        items = [str(item).strip() for item in items if str(item).strip()]
+        if not items:
+            return False
+        english = str(getattr(result, "report_language", "zh") or "zh").lower().startswith(("en", "ko"))
+        suffix = " (program-determined)" if english else "（程序判定）"
+        lines.append(f"**⚠️ {labels['data_limitations_label']}{suffix}**:")
+        lines.extend(f"- {item}" for item in items)
         return True
 
     def generate_aggregate_report(
@@ -451,12 +474,20 @@ class NotificationService(
     def _collect_models_used(self, results: List[AnalysisResult]) -> List[str]:
         if not self._should_show_llm_model():
             return []
-        models: List[str] = []
-        for result in results:
-            model = normalize_model_used(getattr(result, "model_used", None))
-            if model:
-                models.append(model)
-        return list(dict.fromkeys(models))
+        labels = get_report_labels(
+            normalize_report_language(getattr(results[0], "report_language", None)) if results else None
+        )
+        models = [self._model_display(result, labels) for result in results]
+        return list(dict.fromkeys(model for model in models if model))
+
+    @staticmethod
+    def _model_display(result: Any, labels: Dict[str, str]) -> Optional[str]:
+        """Model name, plus the backend when one is recorded; a backend id is never shown as the model."""
+        model = normalize_model_used(getattr(result, "model_used", None))
+        backend = normalize_model_used(getattr(result, "generation_backend", None))
+        if backend and backend != model:
+            return f"{model or labels['model_unknown_label']}（{labels['analysis_backend_label']} {backend}）"
+        return model
 
     def _public_phase_pack_excerpt(self, result: AnalysisResult, report_language: str) -> str:
         return format_public_phase_pack_excerpt(
@@ -1459,9 +1490,16 @@ class NotificationService(
                         ])
                     # 量能分析
                     if vol_data:
+                        ratio_label = (
+                            labels['volume_ratio_5d_label']
+                            if vol_data.get('volume_ratio_basis') == '5d'
+                            else labels['volume_ratio_label']
+                        )
+                        ratio_value = vol_data.get('volume_ratio')
                         report_lines.extend([
-                            f"**{labels['volume_label']}**: {labels['volume_ratio_label']} {vol_data.get('volume_ratio', 'N/A')} ({vol_data.get('volume_status', '')}) | "
-                            f"{labels['turnover_rate_label']} {vol_data.get('turnover_rate', 'N/A')}%",
+                            f"**{labels['volume_label']}**: {ratio_label} "
+                            f"{labels['no_data_label'] if ratio_value is None else ratio_value} ({vol_data.get('volume_status', '')}) | "
+                            f"{labels['turnover_rate_label']} {self._format_turnover_rate(vol_data.get('turnover_rate'), labels)}",
                             f"💡 *{vol_data.get('volume_meaning', '')}*",
                             "",
                         ])
@@ -1990,6 +2028,8 @@ class NotificationService(
         excerpt = self._public_phase_pack_excerpt(result, report_language)
         if excerpt:
             lines.extend([excerpt, ""])
+        if self._append_data_quality_limitations(lines, result, labels):
+            lines.append("")
 
         self._append_market_snapshot(lines, result)
 
@@ -2111,7 +2151,7 @@ class NotificationService(
 
         lines.append("---")
         if self._should_show_llm_model():
-            model_used = normalize_model_used(getattr(result, "model_used", None))
+            model_used = self._model_display(result, labels)
             if model_used:
                 lines.append(f"*{labels['analysis_model_label']}: {model_used}*")
         lines.append(f"*{labels['not_investment_advice']}*")
@@ -2171,35 +2211,24 @@ class NotificationService(
 
         lines.append("")
 
-    _CURRENCY_SUFFIX = {
-        "USD": "美元",
-        "HKD": "港元",
-        "CNY": "元",
-        "RMB": "元",
-        "CNH": "元",
-        "TWD": "新台币",  # 台股 (TWSE/TPEx) 以新台币计价，避免与 A 股「元」(人民币) 混淆
-    }
+    _CURRENCY_SUFFIX = CURRENCY_SUFFIX
 
     @classmethod
     def _format_amount_cn(cls, value: Any, currency: Optional[str] = None) -> str:
-        """Format absolute amounts in 亿/万 + currency suffix; returns N/A on non-numeric.
+        """Format absolute amounts in 亿/万 + currency suffix (shared with the prompt and the text check)."""
+        return format_amount_cn(value, currency)
 
-        ``currency`` accepts ``USD``/``HKD``/``CNY``; unknown values fall back to 元.
-        """
-        try:
-            amount = float(value)
-        except (TypeError, ValueError):
-            return "N/A"
-        if amount != amount:  # NaN
-            return "N/A"
-        sign = "-" if amount < 0 else ""
-        abs_amount = abs(amount)
-        suffix = cls._CURRENCY_SUFFIX.get((currency or "").upper(), "元")
-        if abs_amount >= 1e8:
-            return f"{sign}{abs_amount / 1e8:.2f} 亿{suffix}"
-        if abs_amount >= 1e4:
-            return f"{sign}{abs_amount / 1e4:.2f} 万{suffix}"
-        return f"{sign}{abs_amount:.0f} {suffix}"
+    @staticmethod
+    def _format_turnover_rate(value: Any, labels: Dict[str, str]) -> str:
+        """Missing turnover -> "no data"; a real 0 from a source stays "0%"."""
+        if value is None or isinstance(value, bool):
+            return labels["no_data_label"]
+        if isinstance(value, str):
+            text = value.strip().rstrip("%").strip()
+            if text.lower() in ("", "n/a", "na", "none", "null", "-", "--"):
+                return labels["no_data_label"]
+            return f"{text}%"
+        return f"{value}%"
 
     @staticmethod
     def _format_percent(value: Any) -> str:
@@ -2370,7 +2399,11 @@ class NotificationService(
         cells = {
             "ttm_cash": self._format_per_share(dividend.get("ttm_cash_dividend_per_share"), dividend_currency),
             "ttm_count": str(ttm_event_count) if isinstance(ttm_event_count, int) else "N/A",
-            "ttm_yield": self._format_percent(dividend.get("ttm_dividend_yield_pct")),
+            "ttm_yield": (
+                labels["yield_quote_excluded_label"]
+                if dividend.get("ttm_dividend_yield_unavailable_reason") == "quote_price_excluded"
+                else self._format_percent(dividend.get("ttm_dividend_yield_pct"))
+            ),
             "latest_ex": self._format_text(latest_event.get("ex_dividend_date") or latest_event.get("event_date")),
         }
         if all(v == "N/A" for v in cells.values()):

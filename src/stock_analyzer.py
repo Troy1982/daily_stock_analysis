@@ -18,7 +18,7 @@
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from enum import Enum
 
 import pandas as pd
@@ -48,6 +48,7 @@ class VolumeStatus(Enum):
     SHRINK_VOLUME_UP = "缩量上涨"      # 无量上涨
     SHRINK_VOLUME_DOWN = "缩量回调"    # 缩量回调（好）
     NORMAL = "量能正常"
+    DIRECTION_UNKNOWN = "量价方向不可判定"  # 前一交易日缺漏，无法判定单日涨跌方向
 
 
 class BuySignal(Enum):
@@ -128,8 +129,9 @@ class TrendAnalysisResult:
     rsi_signal: str = ""              # RSI 信号描述
 
     # 买入信号
-    buy_signal: BuySignal = BuySignal.WAIT
-    signal_score: int = 0            # 综合评分 0-100
+    # 前一交易日缺漏（previous_session_known=False）时综合评分与信号不可用，为 None
+    buy_signal: Optional[BuySignal] = BuySignal.WAIT
+    signal_score: Optional[int] = 0  # 综合评分 0-100
     signal_reasons: List[str] = field(default_factory=list)
     risk_factors: List[str] = field(default_factory=list)
     
@@ -152,7 +154,7 @@ class TrendAnalysisResult:
             'volume_trend': self.volume_trend,
             'support_ma5': self.support_ma5,
             'support_ma10': self.support_ma10,
-            'buy_signal': self.buy_signal.value,
+            'buy_signal': self.buy_signal.value if self.buy_signal is not None else None,
             'signal_score': self.signal_score,
             'signal_reasons': self.signal_reasons,
             'risk_factors': self.risk_factors,
@@ -203,13 +205,21 @@ class StockTrendAnalyzer:
         """初始化分析器"""
         pass
     
-    def analyze(self, df: pd.DataFrame, code: str) -> TrendAnalysisResult:
+    def analyze(
+        self,
+        df: pd.DataFrame,
+        code: str,
+        *,
+        previous_session_known: bool = True,
+    ) -> TrendAnalysisResult:
         """
         分析股票趋势
         
         Args:
             df: 包含 OHLCV 数据的 DataFrame
             code: 股票代码
+            previous_session_known: 倒数第二列是否为最新列的前一交易日。为 False 时
+                不输出依赖单日变化的结论（量价方向、MACD 当日交叉），综合评分与买入信号不可用。
             
         Returns:
             TrendAnalysisResult 分析结果
@@ -246,13 +256,13 @@ class StockTrendAnalyzer:
         self._calculate_bias(result)
 
         # 3. 量能分析
-        self._analyze_volume(df, result)
+        self._analyze_volume(df, result, previous_session_known)
 
         # 4. 支撑压力分析
         self._analyze_support_resistance(df, result)
 
         # 5. MACD 分析
-        self._analyze_macd(df, result)
+        self._analyze_macd(df, result, previous_session_known)
 
         # 6. RSI 分析
         self._analyze_rsi(df, result)
@@ -408,7 +418,12 @@ class StockTrendAnalyzer:
         if result.ma20 > 0:
             result.bias_ma20 = (price - result.ma20) / result.ma20 * 100
     
-    def _analyze_volume(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+    def _analyze_volume(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+        previous_session_known: bool = True,
+    ) -> None:
         """
         分析量能
         
@@ -422,7 +437,17 @@ class StockTrendAnalyzer:
         
         if vol_5d_avg > 0:
             result.volume_ratio_5d = float(latest['volume']) / vol_5d_avg
-        
+
+        if not previous_session_known:
+            # 量比仍为“当日量 / 前 5 笔可用列均量”，但这 5 笔跨越缺日；单日涨跌方向未知，
+            # 不合成放量/缩量上涨或下跌。
+            result.volume_status = VolumeStatus.DIRECTION_UNKNOWN
+            result.volume_trend = (
+                f"量比 {result.volume_ratio_5d:.2f}（当日量/前5笔可用交易日均量，区间含缺日）；"
+                "前一交易日缺漏，单日涨跌方向不可判定，不输出放量/缩量涨跌结论"
+            )
+            return
+
         # 判断价格变化
         prev_close = df.iloc[-2]['close']
         price_change = (latest['close'] - prev_close) / prev_close * 100
@@ -479,7 +504,12 @@ class StockTrendAnalyzer:
             if recent_high > price:
                 result.resistance_levels.append(recent_high)
 
-    def _analyze_macd(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+    def _analyze_macd(
+        self,
+        df: pd.DataFrame,
+        result: TrendAnalysisResult,
+        previous_session_known: bool = True,
+    ) -> None:
         """
         分析 MACD 指标
 
@@ -516,6 +546,10 @@ class StockTrendAnalyzer:
         is_crossing_up = prev_zero <= 0 and curr_zero > 0
         is_crossing_down = prev_zero >= 0 and curr_zero < 0
 
+        if not previous_session_known:
+            # 前一可用列不是前一交易日：无法判定交叉是否发生在今日，只保留水平状态。
+            is_golden_cross = is_death_cross = is_crossing_up = is_crossing_down = False
+
         # 判断 MACD 状态
         if is_golden_cross and curr_zero > 0:
             result.macd_status = MACDStatus.GOLDEN_CROSS_ZERO
@@ -541,6 +575,8 @@ class StockTrendAnalyzer:
         else:
             result.macd_status = MACDStatus.BULLISH
             result.macd_signal = " MACD 中性区域"
+        if not previous_session_known:
+            result.macd_signal += "（前一交易日缺漏，当日金叉/死叉/零轴穿越不可判定）"
 
     def _analyze_rsi(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -672,8 +708,10 @@ class StockTrendAnalyzer:
             VolumeStatus.SHRINK_VOLUME_UP: 6,     # 无量上涨较差
             VolumeStatus.HEAVY_VOLUME_DOWN: 0,    # 放量下跌最差
         }
+        volume_known = result.volume_status is not VolumeStatus.DIRECTION_UNKNOWN
         vol_score = volume_scores.get(result.volume_status, 8)
-        score += vol_score
+        if volume_known:
+            score += vol_score
 
         if result.volume_status == VolumeStatus.SHRINK_VOLUME_DOWN:
             reasons.append("✅ 缩量回调，主力洗盘")
@@ -727,9 +765,15 @@ class StockTrendAnalyzer:
             reasons.append(result.rsi_signal)
 
         # === 综合判断 ===
-        result.signal_score = score
         result.signal_reasons = reasons
         result.risk_factors = risks
+        if not volume_known:
+            # 量能分项缺输入：不以中性分代替，综合评分与买入信号均不输出。
+            result.signal_score = None
+            result.buy_signal = None
+            risks.append("⚠️ 前一交易日缺漏，量价方向不可判定：综合评分与买入信号不输出")
+            return
+        result.signal_score = score
 
         # 生成买入信号（与 canonical decision scale 保持一致）
         score_signal = signal_key_for_score(score)
@@ -777,7 +821,7 @@ class StockTrendAnalyzer:
             f"   MA20: {result.ma20:.2f} (乖离 {result.bias_ma20:+.2f}%)",
             f"",
             f"📊 量能分析: {result.volume_status.value}",
-            f"   量比(vs5日): {result.volume_ratio_5d:.2f}",
+            f"   量比(vs5日): {result.volume_ratio_5d:.2f}" if result.volume_ratio_5d is not None else "   量比(vs5日): N/A",
             f"   量能趋势: {result.volume_trend}",
             f"",
             f"📈 MACD指标: {result.macd_status.value}",
@@ -792,8 +836,8 @@ class StockTrendAnalyzer:
             f"   RSI(24): {result.rsi_24:.1f}",
             f"   信号: {result.rsi_signal}",
             f"",
-            f"🎯 操作建议: {result.buy_signal.value}",
-            f"   综合评分: {result.signal_score}/100",
+            f"🎯 操作建议: {result.buy_signal.value if result.buy_signal is not None else '不可判定'}",
+            f"   综合评分: {result.signal_score if result.signal_score is not None else '不可用'}/100",
         ]
 
         if result.signal_reasons:
